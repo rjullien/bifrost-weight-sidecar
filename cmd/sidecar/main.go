@@ -1,15 +1,18 @@
 // Command sidecar runs the Bifrost weight controller: every interval it reads
-// the opencode-go key weights from Bifrost and the quota positions from the
-// OpenCode Go dashboard, computes the target weights, and applies the changes
-// through the Bifrost management API.
+// the opencode-go key weights from Bifrost and the quota positions directly
+// from the OpenCode Go usage API (keys injected in its own environment),
+// computes the target weights, and applies the changes through the Bifrost
+// management API.
 //
-// Phase 1 scope: quota-driven rebalancing only. Dead-key detection from the
-// Bifrost request logs is planned for phase 2.
+// The controller is self-contained: it does NOT depend on the
+// opencode-usage-tracker dashboard (review Baptiste, PR #166). The pace math
+// (weekly/monthly budget, dry days) is reproduced in internal/quotas.
 package main
 
 import (
 	"log"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,7 +24,6 @@ import (
 
 type config struct {
 	BifrostURL      string
-	DashboardURL    string
 	Interval        time.Duration
 	WeeklyThreshold int
 	Pinned          map[string]bool
@@ -31,7 +33,6 @@ type config struct {
 func loadConfig() config {
 	return config{
 		BifrostURL:      envOr("BIFROST_URL", "http://localhost:8080"),
-		DashboardURL:    envOr("DASHBOARD_URL", "http://opencode-dashboard.opencode-dashboard.svc.cluster.local:8080"),
 		Interval:        envDurationOr("INTERVAL", time.Hour),
 		WeeklyThreshold: envIntOr("WEEKLY_THRESHOLD", 80),
 		Pinned:          envSetOr("PINNED_KEYS", nil),
@@ -41,11 +42,11 @@ func loadConfig() config {
 
 func main() {
 	cfg := loadConfig()
-	log.Printf("sidecar: bifrost=%s dashboard=%s interval=%s weekly_threshold=%d%% pinned=%v dry_run=%v",
-		cfg.BifrostURL, cfg.DashboardURL, cfg.Interval, cfg.WeeklyThreshold, cfg.Pinned, cfg.DryRun)
+	log.Printf("sidecar: bifrost=%s interval=%s weekly_threshold=%d%% pinned=%v dry_run=%v",
+		cfg.BifrostURL, cfg.Interval, cfg.WeeklyThreshold, cfg.Pinned, cfg.DryRun)
 
 	bf := bifrost.NewClient(cfg.BifrostURL, 5*time.Second)
-	dash := quotas.NewClient(cfg.DashboardURL, 5*time.Second)
+	qu := quotas.NewClient(5 * time.Second)
 	pol := engine.Config{WeeklyThreshold: cfg.WeeklyThreshold, Pinned: cfg.Pinned}
 
 	run := func() {
@@ -54,9 +55,10 @@ func main() {
 			log.Printf("cycle KO: %v", err)
 			return
 		}
-		agents, err := dash.Usage()
-		if err != nil {
-			log.Printf("cycle KO: %v", err)
+
+		agents := qu.Usage(openCodeKeysFromEnv())
+		if len(agents) == 0 {
+			log.Printf("cycle KO: aucune clé OpenCode dans l'environnement (OPENCODE_GO_API_KEY*)")
 			return
 		}
 
@@ -85,6 +87,37 @@ func main() {
 	for range ticker.C {
 		run()
 	}
+}
+
+// openCodeKeysFromEnv discovers the OpenCode Go subscription keys from the
+// environment, mirroring the dashboard: OPENCODE_GO_API_KEY is "Main",
+// OPENCODE_GO_API_KEY_<SUFFIXE> is "<SUFFIXE>". Empty values are skipped.
+func openCodeKeysFromEnv() quotas.Keys {
+	keys := quotas.Keys{}
+	seen := map[string]bool{}
+
+	envs := os.Environ()
+	sort.Strings(envs)
+	for _, kv := range envs {
+		name, value, ok := strings.Cut(kv, "=")
+		if !ok || value == "" {
+			continue
+		}
+		const prefix = "OPENCODE_GO_API_KEY"
+		if name == prefix {
+			keys["Main"] = value
+			seen["Main"] = true
+			continue
+		}
+		if strings.HasPrefix(name, prefix+"_") {
+			label := strings.TrimPrefix(name, prefix+"_")
+			if !seen[label] {
+				keys[label] = value
+				seen[label] = true
+			}
+		}
+	}
+	return keys
 }
 
 // -- helpers env -- //

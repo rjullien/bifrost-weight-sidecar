@@ -1,4 +1,4 @@
-// Package engine turns Bifrost key state and dashboard quota positions into
+// Package engine turns Bifrost key state and OpenCode Go quota positions into
 // weight changes.
 package engine
 
@@ -66,14 +66,14 @@ func Compute(cfg Config, in Input) []Change {
 //  3. monthly quota projected dry (dryDays>0) → 0 (will sit at the ceiling)
 //  4. otherwise                               → 1 (back in rotation)
 func targetWeight(cfg Config, key bifrost.Key, byLabel map[string]quotas.Agent) float64 {
-	// Rule 1: Bifrost's own key health. Applies even when the dashboard data
+	// Rule 1: Bifrost's own key health. Applies even when the quota data
 	// is missing for this key.
 	if key.Status != "" && key.Status != "success" {
 		return 0
 	}
 
 	agent, ok := byLabel[LabelFromEnv(key.Value.Ref)]
-	// The dashboard does not follow this key, or failed to fetch it.
+	// The OpenCode Go API does not follow this key, or failed to fetch it.
 	if !ok || agent.Error != "" {
 		return -1
 	}
@@ -95,7 +95,7 @@ func targetWeight(cfg Config, key bifrost.Key, byLabel map[string]quotas.Agent) 
 	return 1
 }
 
-// LabelFromEnv derives the dashboard display label from a Bifrost key value
+// LabelFromEnv derives the display label from a Bifrost key value
 // ref, mirroring the dashboard's key discovery: "env.OPENCODE_GO_API_KEY_A"
 // is the "A" subscription, "env.OPENCODE_GO_API_KEY" is "Main".
 func LabelFromEnv(ref string) string {

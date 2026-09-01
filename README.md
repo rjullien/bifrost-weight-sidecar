@@ -13,12 +13,18 @@ chargement des clés en fonction des quotas OpenCode Go.
 À chaque cycle (toutes les `INTERVAL`) :
 
 1. `GET /api/providers/opencode-go/keys` → poids actuels + statut de chaque clé
-2. `GET <DASHBOARD_URL>/api/usage` → quotas par abonnement (dashboard
-   [opencode-usage-tracker](https://github.com/rjullien/opencode-usage-tracker))
-3. Calcul des poids cibles (règles ci-dessous)
+2. `GET https://opencode.ai/zen/go/v1/usage` par clé → quotas **directement**
+   depuis l'API OpenCode Go (les clés `OPENCODE_GO_API_KEY*` sont injectées
+   dans l'environnement du sidecar)
+3. Calcul local du budget (weekly % + projection mensuelle à sec) — **sans**
+   dépendre du dashboard [opencode-usage-tracker](https://github.com/rjullien/opencode-usage-tracker)
 4. `PUT /api/providers/opencode-go/keys/{id}` pour chaque changement
 
-Le mapping clé Bifrost ↔ abonnement dashboard se fait par la référence
+> **Découplage dashboard (revue Baptiste PR #166)** : le sidecar ne consomme
+> PAS l'API du dashboard. Il lit l'API OpenCode Go directement et reproduit la
+> math de budget localement. Le dashboard peut tomber sans impact sur le sidecar.
+
+Le mapping clé Bifrost ↔ clé OpenCode se fait par la référence
 d'environnement (`env.OPENCODE_GO_API_KEY_A` → label `A`,
 `env.OPENCODE_GO_API_KEY` → `Main`), la même règle que celle du dashboard.
 
@@ -40,11 +46,11 @@ incomplètes.
 | Variable | Défaut | Description |
 |----------|--------|-------------|
 | `BIFROST_URL` | `http://localhost:8080` | Base URL du gateway Bifrost (localhost quand sidecar dans le pod) |
-| `DASHBOARD_URL` | `http://opencode-dashboard.opencode-dashboard.svc.cluster.local:8080` | Base URL du dashboard quotas |
 | `INTERVAL` | `1h` | Durée entre deux cycles (`30m`, `45s`, …) |
 | `WEEKLY_THRESHOLD` | `80` | % weekly au-delà duquel une clé sort de rotation (`0` désactive la règle) |
 | `PINNED_KEYS` | *(vide)* | Clés à ne JAMAIS toucher, séparées par des virgules (nom ou id) |
 | `DRY_RUN` | `false` | Log les changements sans les appliquer |
+| `OPENCODE_GO_API_KEY*` | *(requis)* | Clés OpenCode Go à surveiller : `OPENCODE_GO_API_KEY` = Main, `OPENCODE_GO_API_KEY_A` = A, etc. |
 
 ## Déploiement
 
