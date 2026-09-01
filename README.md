@@ -30,24 +30,34 @@ d'environnement (`env.OPENCODE_GO_API_KEY_A` → label `A`,
 
 ## Règles (par ordre de priorité)
 
+**Politique : « cramer le monthly, garde-fou weekly, secours ≥ 2 »** — le quota
+mensuel non consommé avant le reset anniversaire est **perdu**, donc le poids
+d'une clé reflète l'urgence de consommation :
+
 | # | Règle | Poids |
 |---|-------|-------|
 | 1 | Bifrost signale la clé non saine (`status != success`) | `0` |
-| 2 | Consommation weekly ≥ `WEEKLY_THRESHOLD` | `0` |
-| 3 | Quota mensuel projeté à sec (`dryDays > 0`) | `0` |
-| 4 | Sinon (clé saine, budget OK) | `1` |
+| 2 | Weekly projeté à sec avant son reset lundi (bloqueur) | `0` |
+| 3 | Monthly épuisé / projeté à sec jusqu'au reset | `0` |
+| 4 | Sinon | **urgence** = monthly restant (%) ÷ jours restants |
 
-Une clé dont les quotas ne sont **pas évaluables** (absente du dashboard, ou
-agent en erreur) est laissée **intacte** : jamais de décision sur données
-incomplètes.
+**Urgence** : plus le monthly restant expire vite, plus le poids est élevé (la
+clé « crame » son quota avant qu'il soit perdu). Bifrost route en proportion
+des poids (float acceptés — vérifié runtime).
+
+**Secours** : au moins **2 clés** gardent toujours un poids non nul (pool de
+fallback), réarmées par urgence décroissante — le pool ne reste jamais sans
+seconde clé disponible.
+
+Une clé dont les quotas ne sont **pas évaluables** (absente de l'API, ou agent
+en erreur) est laissée **intacte** : jamais de décision sur données incomplètes.
 
 ## Variables d'environnement
 
 | Variable | Défaut | Description |
 |----------|--------|-------------|
-| `BIFROST_URL` | `http://127.0.0.1:8080` | Base URL du gateway Bifrost (localhost quand sidecar dans le pod) |
+| `BIFROST_URL` | `http://127.0.0.1:8080` | Base URL du gateway Bifrost (localhost IPv4 quand sidecar dans le pod) |
 | `INTERVAL` | `1h` | Durée entre deux cycles (`30m`, `45s`, …) |
-| `WEEKLY_THRESHOLD` | `80` | % weekly au-delà duquel une clé sort de rotation (`0` désactive la règle) |
 | `PINNED_KEYS` | *(vide)* | Clés à ne JAMAIS toucher, séparées par des virgules (nom ou id) |
 | `DRY_RUN` | `false` | Log les changements sans les appliquer |
 | `OPENCODE_GO_API_KEY*` | *(requis)* | Clés OpenCode Go à surveiller : `OPENCODE_GO_API_KEY` = Main, `OPENCODE_GO_API_KEY_A` = A, etc. |
