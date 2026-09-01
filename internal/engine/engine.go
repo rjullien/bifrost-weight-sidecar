@@ -3,32 +3,34 @@
 //
 // Weight policy — "cramer le monthly, garde-fou weekly, secours ≥ 2":
 //
-//   - The MONTHLY quota is lost if not consumed before the subscription
-//     anniversary reset (use-it-or-lose-it). The weight of a key reflects how
-//     much monthly quota remains versus how few days are left: the more quota
-//     about to expire, the more traffic the key gets. When at the ceiling
-//     (100%), there is nothing left to burn: weight 0.
-//   - The WEEKLY quota is a blocker, not a loss: when it hits the ceiling the
-//     key stops serving until its Monday reset. The engine anticipates the
-//     wall (projection) and takes the key out before it blocks.
-//   - At least MinActive keys (2) always keep a non-zero weight as a fallback,
-//     even when their urgency is low: never leave the pool without a spare.
+//   - Monthly quota is use-it-or-lose-it. A healthy key's weight reflects the
+//     remaining monthly quota divided by days until reset.
+//   - Weekly and monthly projected exhaustion remove a key from normal routing.
+//   - The fallback may re-arm a key that is only projected to exhaust, but
+//     never one already at a weekly/monthly ceiling or unhealthy in Bifrost.
+//   - MinActive counts distinct enabled healthy subscriptions, including pinned
+//     and untouched healthy keys; duplicate Bifrost entries sharing one env
+//     ref count once.
 package engine
 
 import (
+	"math"
+	"sort"
 	"strings"
 
 	"github.com/rjullien/bifrost-weight-sidecar/internal/bifrost"
 	"github.com/rjullien/bifrost-weight-sidecar/internal/quotas"
 )
 
+const weightScale = 1000.0
+
 // Config holds the policy knobs of the controller.
 type Config struct {
 	// Pinned lists key names (or ids) the controller must never touch:
 	// manual decisions win over automation for those keys.
 	Pinned map[string]bool
-	// MinActive is the minimum number of keys that must keep a non-zero
-	// weight at all times (fallback pool). Defaults to 2 when 0.
+	// MinActive is the minimum number of distinct healthy subscriptions that
+	// should keep a non-zero weight. Defaults to 2 when below 1.
 	MinActive int
 }
 
@@ -45,162 +47,195 @@ type Input struct {
 	Agents []quotas.Agent
 }
 
-// urgency is the monthly burn rate: how much monthly quota (percent) remains
-// per day until the reset. The higher, the more the key must be pushed.
+// WeightsEqual compares controller weights at the precision persisted by the
+// policy. Exported so the orchestration layer can detect concurrent changes.
+func WeightsEqual(a, b float64) bool {
+	if math.IsNaN(a) || math.IsNaN(b) || math.IsInf(a, 0) || math.IsInf(b, 0) {
+		return false
+	}
+	return math.Abs(a-b) < 0.5/weightScale
+}
+
+func normalizeWeight(weight float64) (float64, bool) {
+	if weight < 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
+		return 0, false
+	}
+	return math.Round(weight*weightScale) / weightScale, true
+}
+
+// urgency is the monthly burn rate: how much monthly quota remains per day.
 func urgency(agent *quotas.Agent) (float64, bool) {
-	if agent == nil {
+	if agent == nil || agent.Error != "" {
 		return 0, false
 	}
 	pct := agent.MonthlyPercent()
 	days := agent.MonthlyDaysLeft()
-	if pct < 0 || days < 0 || days <= 0 {
+	if pct < 0 || pct > 100 || days <= 0 || math.IsNaN(days) || math.IsInf(days, 0) {
 		return 0, false
 	}
-	remaining := float64(100 - pct)
-	if remaining < 0 {
-		remaining = 0
-	}
-	return remaining / days, true
+	return normalizeWeight(float64(100-pct) / days)
 }
 
-// Compute decides the target weight of every key and returns the changes
-// needed. A key is left untouched (no Change) when its quotas cannot be
-// assessed: acting on partial information could zero out a healthy key.
+// Compute decides the target weight of every managed key. Healthy keys whose
+// quotas cannot be assessed and pinned keys are left untouched, but still
+// count toward the fallback pool when already active.
 func Compute(cfg Config, in Input) []Change {
 	if cfg.MinActive < 1 {
 		cfg.MinActive = 2
 	}
+
+	// Duplicate labels are ambiguous. Mark them nil so no ordering-dependent
+	// quota decision can be made for that subscription.
 	byLabel := make(map[string]*quotas.Agent, len(in.Agents))
 	for i := range in.Agents {
-		byLabel[in.Agents[i].Label] = &in.Agents[i]
-	}
-
-	// Step 1: compute the raw target for every assessable key.
-	type target struct {
-		key    bifrost.Key
-		weight float64
-	}
-	var targets []target
-	for _, key := range in.Keys {
-		if cfg.Pinned[key.Name] || cfg.Pinned[key.ID] {
+		label := in.Agents[i].Label
+		if _, exists := byLabel[label]; exists {
+			byLabel[label] = nil
 			continue
 		}
-		t := targetWeight(cfg, key, byLabel)
-		if t < 0 {
-			continue // not assessable: leave untouched
-		}
-		targets = append(targets, target{key: key, weight: t})
+		byLabel[label] = &in.Agents[i]
 	}
 
-	// Step 2: guarantee the fallback pool — MinActive keys must keep a
-	// non-zero weight. Mettre toutes les clés à 0 tue le provider entier :
-	// on garde toujours 2 clés vivantes, la première à 1 et la seconde à
-	// 0.5 (poids faible mais non nul), réarmées par urgence décroissante.
-	//
-	// Seules les clés avec encore du monthly à cramer (urgence > 0) peuvent
-	// être réarmées : une clé à 100% (monthly dry) ou morte côté Bifrost ne
-	// répondra pas — lui rendre un poids ne ferait qu'envoyer du trafic vers
-	// une clé en échec. Le fallback ne ressuscite que ce qui peut servir.
-	active := 0
-	for _, t := range targets {
-		if t.weight > 0 {
-			active++
-		}
+	type target struct {
+		inputIndex int
+		key        bifrost.Key
+		label      string
+		agent      *quotas.Agent
+		weight     float64
 	}
-	if active < cfg.MinActive {
-		// Sort candidates by urgency descending so the most urgent keys
-		// become the fallback pool.
-		for i := 0; i < len(targets)-1; i++ {
-			for j := i + 1; j < len(targets); j++ {
-				ui, _ := urgency(byLabel[quotasLabel(targets[i].key)])
-				uj, _ := urgency(byLabel[quotasLabel(targets[j].key)])
-				if uj > ui {
-					targets[i], targets[j] = targets[j], targets[i]
-				}
-			}
+
+	// effective starts from the actual pool state and is overwritten only for
+	// assessable, non-pinned keys managed through OPENCODE_GO_API_KEY refs.
+	effective := make([]float64, len(in.Keys))
+	for i := range in.Keys {
+		effective[i] = in.Keys[i].Weight
+	}
+
+	var targets []target
+	for i, key := range in.Keys {
+		label := LabelFromEnv(key.Value.Ref)
+		if label == "" || cfg.Pinned[key.Name] || cfg.Pinned[key.ID] {
+			continue
 		}
-		// Re-arm keys with burnable monthly quota (urgency > 0) until
-		// MinActive are alive: first at 1, second at 0.5 — a live spare
-		// carrying little traffic, never 0. Keys killed by Bifrost health or
-		// with no monthly quota left are NOT re-armed: they would fail.
-		for i := 0; i < len(targets) && active < cfg.MinActive; i++ {
-			if targets[i].weight > 0 || targets[i].key.Status != "success" {
+		weight := targetWeight(key, byLabel)
+		if weight < 0 {
+			continue
+		}
+		effective[i] = weight
+		targets = append(targets, target{
+			inputIndex: i,
+			key:        key,
+			label:      label,
+			agent:      byLabel[label],
+			weight:     weight,
+		})
+	}
+
+	// Count distinct enabled healthy subscriptions in the effective final state.
+	// This includes pinned and quota-unknown keys and collapses duplicate refs.
+	active := make(map[string]bool)
+	for i, key := range in.Keys {
+		if key.Status != "success" || !routingEnabled(key) || effective[i] <= 0 {
+			continue
+		}
+		active[subscriptionIdentity(key)] = true
+	}
+
+	if len(active) < cfg.MinActive {
+		sort.SliceStable(targets, func(i, j int) bool {
+			ui, _ := urgency(targets[i].agent)
+			uj, _ := urgency(targets[j].agent)
+			return ui > uj
+		})
+
+		for i := range targets {
+			if len(active) >= cfg.MinActive {
+				break
+			}
+			t := &targets[i]
+			identity := subscriptionIdentity(t.key)
+			if t.weight > 0 || active[identity] || !fallbackEligible(t.key, t.agent) {
 				continue
 			}
-			agent := byLabel[quotasLabel(targets[i].key)]
-			u, ok := urgency(agent)
-			if !ok || u <= 0 {
-				continue // no monthly quota left to burn: really dead
-			}
-			if active == 0 {
-				targets[i].weight = 1
+			if len(active) == 0 {
+				t.weight = 1
 			} else {
-				targets[i].weight = 0.5
+				t.weight = 0.5
 			}
-			active++
+			effective[t.inputIndex] = t.weight
+			active[identity] = true
 		}
 	}
 
-	// Step 3: diff against the current weights.
 	var changes []Change
 	for _, t := range targets {
-		if t.weight != t.key.Weight {
+		if !WeightsEqual(t.weight, t.key.Weight) {
 			changes = append(changes, Change{Key: t.key, From: t.key.Weight, To: t.weight})
 		}
 	}
 	return changes
 }
 
-// quotasLabel maps a key's value ref to its agent label.
-func quotasLabel(key bifrost.Key) string {
-	return LabelFromEnv(key.Value.Ref)
+func routingEnabled(key bifrost.Key) bool {
+	return key.Enabled == nil || *key.Enabled
 }
 
-// targetWeight returns the weight a key should have, or -1 when the state is
-// not assessable (quota data missing for this key).
-//
-// Rules, in priority order:
-//  1. Bifrost reports the key as not healthy  → 0 (dead key)
-//  2. weekly projected dry (dryDays > 0)     → 0 (will block before Monday)
-//  3. monthly at the ceiling (dryDays > 0)   → 0 (nothing left to burn)
-//  4. otherwise                              → urgency (monthly remaining /
-//     days left) — the more quota about to expire, the more traffic.
-func targetWeight(cfg Config, key bifrost.Key, byLabel map[string]*quotas.Agent) float64 {
-	// Rule 1: Bifrost's own key health. Applies even when the quota data
-	// is missing for this key.
+func subscriptionIdentity(key bifrost.Key) string {
+	if label := LabelFromEnv(key.Value.Ref); label != "" {
+		return "quota:" + label
+	}
+	return "key:" + key.ID
+}
+
+// fallbackEligible permits a last-resort re-arm only while quota remains.
+// A projected wall may be crossed to preserve availability; an already reached
+// weekly/monthly ceiling and unhealthy Bifrost status are hard stops.
+func fallbackEligible(key bifrost.Key, agent *quotas.Agent) bool {
+	if key.Status != "success" || !routingEnabled(key) || agent == nil || agent.Error != "" {
+		return false
+	}
+	if agent.WeeklyPercent() >= 100 || agent.MonthlyPercent() >= 100 {
+		return false
+	}
+	u, ok := urgency(agent)
+	return ok && u > 0
+}
+
+// targetWeight returns a non-negative target, or -1 when the state is not
+// assessable. It is called only for managed env references.
+func targetWeight(key bifrost.Key, byLabel map[string]*quotas.Agent) float64 {
+	if !routingEnabled(key) {
+		return -1
+	}
 	if key.Status != "success" {
 		return 0
 	}
 
-	agent, ok := byLabel[LabelFromEnv(key.Value.Ref)]
-	// The OpenCode Go API does not follow this key, or failed to fetch it.
-	if !ok || agent == nil || agent.Error != "" {
+	agent := byLabel[LabelFromEnv(key.Value.Ref)]
+	if agent == nil || agent.Error != "" {
 		return -1
 	}
 
+	weeklyPercent := agent.WeeklyPercent()
+	monthlyPercent := agent.MonthlyPercent()
 	weeklyDry := agent.WeeklyDryDays()
 	monthlyDry := agent.MonthlyDryDays()
+	if weeklyPercent < 0 || weeklyPercent > 100 || monthlyPercent < 0 || monthlyPercent > 100 ||
+		weeklyDry < 0 || monthlyDry < 0 {
+		return -1
+	}
 
-	// Rule 2: weekly blocker projected.
-	if weeklyDry >= 0 && weeklyDry > 0 {
+	if weeklyDry > 0 || monthlyDry > 0 {
 		return 0
 	}
 
-	// Rule 3: monthly quota exhausted (or projected dry until the reset).
-	if monthlyDry >= 0 && monthlyDry > 0 {
-		return 0
-	}
-
-	// Rule 4: burn the monthly — weight proportional to what would be lost.
 	if u, ok := urgency(agent); ok {
 		return u
 	}
-	return -1 // no monthly signal: leave untouched
+	return -1
 }
 
-// LabelFromEnv derives the display label from a Bifrost key value
-// ref, mirroring the dashboard's key discovery: "env.OPENCODE_GO_API_KEY_A"
-// is the "A" subscription, "env.OPENCODE_GO_API_KEY" is "Main".
+// LabelFromEnv derives the subscription label from a Bifrost env reference.
 func LabelFromEnv(ref string) string {
 	const prefix = "env.OPENCODE_GO_API_KEY"
 	if ref == prefix {

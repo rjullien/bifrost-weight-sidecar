@@ -83,6 +83,7 @@ func TestSetWeightSendsFullPayload(t *testing.T) {
 		Value:  SecretRef{Ref: "env.OPENCODE_GO_API_KEY_A", Type: "env"},
 		Models: []string{"*"},
 		Weight: 1,
+		Status: "success",
 	}
 	if err := c.SetWeight(key, 0); err != nil {
 		t.Fatalf("SetWeight: %v", err)
@@ -110,23 +111,27 @@ func TestSetWeightSendsFullPayload(t *testing.T) {
 	}
 }
 
-// models defaults to ["*"] when the key carries none, so an update never
-// wipes the model list.
-func TestSetWeightDefaultsModels(t *testing.T) {
+// An empty model whitelist means "allow none" in Bifrost and must remain
+// empty rather than being broadened to ["*"].
+func TestSetWeightPreservesEmptyModels(t *testing.T) {
 	var got map[string]any
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&got)
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{}`)
+		fmt.Fprint(w, `{"id":"k1","weight":1}`)
 	})
 
-	key := Key{ID: "k1", Name: "k1", Value: SecretRef{Ref: "env.OPENCODE_GO_API_KEY", Type: "env"}}
+	key := Key{
+		ID: "k1", Name: "k1", Status: "success",
+		Value:  SecretRef{Ref: "env.OPENCODE_GO_API_KEY", Type: "env"},
+		Models: []string{},
+	}
 	if err := c.SetWeight(key, 1); err != nil {
 		t.Fatalf("SetWeight: %v", err)
 	}
-	models := got["models"].([]any)
-	if len(models) != 1 || models[0] != "*" {
-		t.Errorf("models = %v, want [\"*\"]", got["models"])
+	models, ok := got["models"].([]any)
+	if !ok || len(models) != 0 {
+		t.Errorf("models = %v, want an empty list", got["models"])
 	}
 }
 
@@ -142,8 +147,14 @@ func TestKeysSurfacesErrors(t *testing.T) {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, `{"error":"Key value must not be empty"}`)
 	})
-	if err := c2.SetWeight(Key{ID: "k1", Name: "k1", Value: SecretRef{Ref: "env.X", Type: "env"}}, 1); err == nil ||
-		!strings.Contains(err.Error(), "Key value must not be empty") {
-		t.Errorf("SetWeight error = %v, want a 400 surfaced", err)
+	err := c2.SetWeight(Key{
+		ID: "k1", Name: "k1", Status: "success",
+		Value: SecretRef{Ref: "env.OPENCODE_GO_API_KEY", Type: "env"},
+	}, 1)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 400") {
+		t.Errorf("SetWeight error = %v, want HTTP 400", err)
+	}
+	if strings.Contains(err.Error(), "Key value must not be empty") {
+		t.Errorf("SetWeight leaked remote response body: %v", err)
 	}
 }

@@ -18,7 +18,10 @@ chargement des clés en fonction des quotas OpenCode Go.
    dans l'environnement du sidecar)
 3. Calcul local du budget (weekly % + projection mensuelle à sec) — **sans**
    dépendre du dashboard [opencode-usage-tracker](https://github.com/rjullien/opencode-usage-tracker)
-4. `PUT /api/providers/opencode-go/keys/{id}` pour chaque changement
+4. Relecture complète de Bifrost, puis relecture de chaque clé juste avant son
+   `PUT /api/providers/opencode-go/keys/{id}`. Les augmentations sont appliquées
+   avant les baisses ; si une activation échoue, les baisses restantes sont
+   annulées. Un dernier snapshot vérifie les poids effectivement persistés.
 
 > **Découplage dashboard (revue Baptiste PR #166)** : le sidecar ne consomme
 > PAS l'API du dashboard. Il lit l'API OpenCode Go directement et reproduit la
@@ -45,16 +48,29 @@ d'une clé reflète l'urgence de consommation :
 clé « crame » son quota avant qu'il soit perdu). Bifrost route en proportion
 des poids (float acceptés — vérifié runtime).
 
-**Secours** : le contrôleur essaie de garder au moins **2 clés utilisables** avec
-un poids non nul — la première à **1**, les suivantes à **0.5** (réserve
-vivante, peu de trafic mais disponible). Les clés mortes côté Bifrost
-(`status != success`) ou sans quota mensuel restant ne sont **jamais**
-réarmées : si moins de deux clés peuvent réellement servir, le contrôleur
-préfère laisser le pool dégradé plutôt que leur envoyer du trafic voué à
-échouer.
+**Secours** : le contrôleur essaie de garder au moins **2 abonnements distincts**
+avec un poids non nul — la première à **1**, les suivantes à **0.5** (réserve
+vivante, peu de trafic mais disponible). Plusieurs lignes Bifrost qui pointent
+vers la même variable d'environnement ne comptent qu'une fois. Les clés pinned
+et les clés saines, non explicitement désactivées et déjà pondérées dont le quota est
+inconnu comptent dans ce minimum sans être modifiées. Une clé avec
+`enabled: false` reste intacte et ne compte jamais comme secours actif.
 
-Une clé dont les quotas ne sont **pas évaluables** (absente de l'API, ou agent
-en erreur) est laissée **intacte** : jamais de décision sur données incomplètes.
+Une projection weekly/monthly à sec peut être réarmée en dernier recours pour
+préserver la disponibilité. En revanche, une clé morte côté Bifrost
+(`status != success`) ou ayant **déjà atteint 100 %** en weekly ou monthly ne
+l'est jamais : si moins de deux abonnements peuvent réellement servir, le
+contrôleur préfère laisser le pool dégradé plutôt que leur envoyer du trafic
+voué à échouer.
+
+Une clé dont les quotas ne sont **pas évaluables** (absente de l'API, agent en
+erreur, fenêtres monthly/weekly manquantes, statut différent de `ok`, pourcentage
+hors de `[0,100]` ou reset hors période active) est laissée **intacte** : jamais
+de décision de quota sur des données incomplètes. Le statut Bifrost reste un
+signal indépendant : une clé non saine est mise à `0`, même si aucun quota
+OpenCode n'est disponible. La fenêtre rolling est purement informative : si elle
+est absente ou invalide, elle est ignorée tant que monthly et weekly sont
+valides.
 
 ## Variables d'environnement
 
@@ -62,9 +78,32 @@ en erreur) est laissée **intacte** : jamais de décision sur données incomplè
 |----------|--------|-------------|
 | `BIFROST_URL` | `http://127.0.0.1:8080` | URL HTTP(S) absolue du gateway Bifrost, sans query ni fragment (localhost IPv4 quand sidecar dans le pod) |
 | `INTERVAL` | `1h` | Durée strictement positive entre la fin d’un cycle et le suivant (`30m`, `45s`, …) |
+| `CYCLE_TIMEOUT` | `5m` | Durée maximale strictement positive d'un cycle complet ; annule aussi les requêtes HTTP en cours |
+| `RETRY_BACKOFF` | `15s` | Délai initial strictement positif avant réessai quand Bifrost est injoignable ; double à chaque échec jusqu'à 5 min |
 | `PINNED_KEYS` | *(vide)* | Clés à ne JAMAIS toucher, séparées par des virgules (nom ou id) |
-| `DRY_RUN` | `false` | Log les changements sans les appliquer |
+| `DRY_RUN` | `false` | Booléen strict (`true`/`false`, formes acceptées par Go) : log les changements sans les appliquer |
 | `OPENCODE_GO_API_KEY*` | *(requis)* | Clés OpenCode Go à surveiller : `OPENCODE_GO_API_KEY` = Main, `OPENCODE_GO_API_KEY_A` = A, etc. |
+
+Le premier cycle démarre immédiatement. `SIGTERM` et `SIGINT` annulent le cycle
+ou l'attente en cours, puis arrêtent proprement le processus.
+
+Quand Bifrost est injoignable (souvent son bootstrap au démarrage du pod, ~35 s
+sur Bifrost v2), le sidecar réessaie avec un backoff exponentiel `RETRY_BACKOFF`
+→ ×2 → … plafonné à 5 min, au lieu d'attendre l'`INTERVAL` complet. Le backoff
+est remis à zéro dès qu'un cycle atteint Bifrost, et cette attente reste elle
+aussi interruptible par un signal d'arrêt.
+
+## CI et publication
+
+Les pull requests exécutent les tests, `go vet`, `govulncheck` et un build
+Docker multi-architecture sans permission d'écriture sur GHCR. La publication
+est réservée aux pushes sur `main`, aux tags `v*`, aux déclenchements manuels et,
+en fallback, à la fermeture d'une PR effectivement mergée. Ce fallback ne
+checkout jamais la branche de la PR : il reconstruit uniquement `main`.
+
+Les GitHub Actions et l'image Go du builder sont épinglées par SHA/digest. Les
+images publiées pour `linux/amd64` et `linux/arm64` embarquent une provenance et
+un SBOM OCI. Le job de publication est le seul à disposer de `packages: write`.
 
 ## Déploiement
 

@@ -1,14 +1,9 @@
-// Package quotas reads the OpenCode Go usage API directly
-// (https://opencode.ai/zen/go/v1/usage) with the subscription keys injected in
-// the sidecar environment. It yields the quota position of every subscription,
-// keyed by display label (Main, A, N, R, …).
-//
-// The dashboard (opencode-usage-tracker) is deliberately NOT used: the sidecar
-// must stay decoupled from it (Baptiste, review PR #166). The pace/math logic
-// is reproduced here so the sidecar is self-contained.
+// Package quotas reads the OpenCode Go usage API directly and computes the
+// weekly/monthly pace used by the weight engine.
 package quotas
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,7 +15,7 @@ import (
 	"time"
 )
 
-// apiURL is the OpenCode Go usage endpoint. Variable so tests can redirect it.
+// apiURL is variable so tests can redirect requests.
 var apiURL = "https://opencode.ai/zen/go/v1/usage"
 
 const (
@@ -28,16 +23,15 @@ const (
 	maxResponseBody       = 1 << 20 // 1 MiB
 )
 
-// Agent is one subscription as exposed by the OpenCode Go API, enriched with
-// the local budget computation.
+// Agent is one subscription enriched with local budget computation.
 type Agent struct {
 	Label   string   `json:"label"`
 	Windows []Window `json:"windows"`
 	Error   string   `json:"error,omitempty"`
 }
 
-// Window is one quota window. Budget is present on the windows the engine
-// grades on pace (weekly and monthly); rolling carries none.
+// Window is one quota window. Weekly and monthly always carry a valid Budget
+// when an Agent has no Error.
 type Window struct {
 	Name    string  `json:"name"`
 	Percent int     `json:"percent"`
@@ -45,15 +39,13 @@ type Window struct {
 	Budget  *Budget `json:"budget,omitempty"`
 }
 
-// Budget is the pace computation for a period-based window, reproduced from
-// the dashboard's internal/opencode/budget.go.
+// Budget is the pace computation for a period-based window.
 type Budget struct {
 	Valid    bool    `json:"valid"`
 	DryDays  float64 `json:"dryDays"`
 	DaysLeft float64 `json:"daysLeft,omitempty"`
 }
 
-// apiResponse matches the real OpenCode Go API response format.
 type apiResponse struct {
 	Usage struct {
 		Rolling *windowRaw `json:"rolling"`
@@ -64,26 +56,38 @@ type apiResponse struct {
 
 type windowRaw struct {
 	Status   string `json:"status"`
-	Percent  int    `json:"percent"`
+	Percent  *int   `json:"percent"`
 	ResetsAt string `json:"resetsAt"`
 }
 
-// Client calls the OpenCode Go usage API for a set of keys.
+// Client calls the OpenCode Go usage API.
 type Client struct {
 	http *http.Client
 }
 
-// NewClient creates a Client with the given timeout.
+// NewClient creates a Client that refuses redirects so credentials are never
+// forwarded to a different origin.
 func NewClient(timeout time.Duration) *Client {
-	return &Client{http: &http.Client{Timeout: timeout}}
+	return &Client{http: &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}}
 }
 
 // Keys maps a display label (Main, A, N, R, …) to its API key value.
 type Keys map[string]string
 
-// Usage fetches the quota position of every given key, directly from the
-// OpenCode Go API. A key that fails to fetch yields an Agent carrying Error.
+// Usage is the context-free compatibility wrapper used by package tests.
 func (c *Client) Usage(keys Keys) []Agent {
+	return c.UsageContext(context.Background(), keys)
+}
+
+// UsageContext fetches every subscription with at most four concurrent
+// requests. A single timestamp is shared by the whole cycle so equal payloads
+// produce equal budgets regardless of response latency.
+func (c *Client) UsageContext(ctx context.Context, keys Keys) []Agent {
 	labels := make([]string, 0, len(keys))
 	for label := range keys {
 		labels = append(labels, label)
@@ -91,6 +95,11 @@ func (c *Client) Usage(keys Keys) []Agent {
 	sort.Strings(labels)
 
 	agents := make([]Agent, len(labels))
+	if len(labels) == 0 {
+		return agents
+	}
+
+	now := time.Now().UTC()
 	jobs := make(chan int)
 	workers := min(maxConcurrentRequests, len(labels))
 	var wg sync.WaitGroup
@@ -101,7 +110,7 @@ func (c *Client) Usage(keys Keys) []Agent {
 			for i := range jobs {
 				label := labels[i]
 				a := Agent{Label: label}
-				windows, err := c.fetchKey(keys[label])
+				windows, err := c.fetchKey(ctx, keys[label], now)
 				if err != nil {
 					a.Error = err.Error()
 				} else {
@@ -119,13 +128,13 @@ func (c *Client) Usage(keys Keys) []Agent {
 	return agents
 }
 
-func (c *Client) fetchKey(apiKey string) ([]Window, error) {
+func (c *Client) fetchKey(ctx context.Context, apiKey string, now time.Time) ([]Window, error) {
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" {
 		return nil, fmt.Errorf("clé OpenCode vide")
 	}
 
-	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -143,66 +152,81 @@ func (c *Client) fetchKey(apiKey string) ([]Window, error) {
 	if err != nil {
 		return nil, fmt.Errorf("lecture réponse API: %w", err)
 	}
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return nil, fmt.Errorf("clé invalide ou expirée (HTTP %d)", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API OpenCode HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
+		return nil, fmt.Errorf("API OpenCode HTTP %d", resp.StatusCode)
 	}
 
-	return parseWindows(body)
+	return parseWindowsAt(body, now)
 }
 
-func parseWindows(body []byte) ([]Window, error) {
+// parseWindowsAt fails closed: both policy windows must be present, healthy,
+// bounded and active at the cycle timestamp. The private /usage schema is not
+// publicly documented, so only the captured production status "ok" is trusted.
+func parseWindowsAt(body []byte, now time.Time) ([]Window, error) {
 	var resp apiResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("réponse API invalide: %w", err)
 	}
-
-	now := time.Now().UTC()
-	var windows []Window
-
-	// Monthly first: it is the window that actually constrains the month.
-	if w := resp.Usage.Monthly; w != nil {
-		windows = append(windows, windowFrom("Monthly", w, now))
-	}
-	if w := resp.Usage.Weekly; w != nil {
-		windows = append(windows, windowFrom("Weekly", w, now))
-	}
-	if w := resp.Usage.Rolling; w != nil {
-		windows = append(windows, Window{Name: "Rolling 5h", Percent: w.Percent})
+	if resp.Usage.Monthly == nil || resp.Usage.Weekly == nil {
+		return nil, fmt.Errorf("réponse API incomplète: fenêtres monthly et weekly requises")
 	}
 
-	if len(windows) == 0 {
-		return nil, fmt.Errorf("aucune fenêtre trouvée: %s", truncate(string(body), 300))
+	monthly, err := periodWindowFrom("Monthly", resp.Usage.Monthly, now)
+	if err != nil {
+		return nil, err
+	}
+	weekly, err := periodWindowFrom("Weekly", resp.Usage.Weekly, now)
+	if err != nil {
+		return nil, err
+	}
+	windows := []Window{monthly, weekly}
+
+	// Rolling is informational only: expose it when valid, but never let this
+	// optional telemetry freeze decisions based on healthy policy windows.
+	if resp.Usage.Rolling != nil {
+		if rolling, err := rawWindowFrom("Rolling 5h", resp.Usage.Rolling); err == nil {
+			windows = append(windows, rolling)
+		}
 	}
 	return windows, nil
 }
 
-func windowFrom(name string, raw *windowRaw, now time.Time) Window {
-	w := Window{Name: name, Percent: raw.Percent}
-	if t, err := time.Parse(time.RFC3339Nano, raw.ResetsAt); err == nil {
-		w.Resets = t.Format(time.RFC3339)
-	} else if t, err := time.Parse(time.RFC3339, raw.ResetsAt); err == nil {
-		w.Resets = t.Format(time.RFC3339)
+func rawWindowFrom(name string, raw *windowRaw) (Window, error) {
+	if raw.Status != "ok" {
+		return Window{}, fmt.Errorf("fenêtre %s invalide: status=%q", name, raw.Status)
 	}
-
-	if b := computeBudget(w, now); b.Valid {
-		w.Budget = &b
+	if raw.Percent == nil || *raw.Percent < 0 || *raw.Percent > 100 {
+		return Window{}, fmt.Errorf("fenêtre %s invalide: percent doit être compris entre 0 et 100", name)
 	}
-	return w
+	reset, err := time.Parse(time.RFC3339Nano, raw.ResetsAt)
+	if err != nil || reset.IsZero() {
+		return Window{}, fmt.Errorf("fenêtre %s invalide: resetsAt incorrect", name)
+	}
+	return Window{Name: name, Percent: *raw.Percent, Resets: reset.Format(time.RFC3339)}, nil
 }
 
-// computeBudget reproduces the dashboard's ComputeBudget: the weekly window
-// resets every 7 days; the monthly window is a subscription anniversary
-// (1 calendar month before the reset). DryDays > 0 means the quota is
-// projected to sit at the ceiling before the reset.
-func computeBudget(w Window, now time.Time) Budget {
-	b := Budget{Valid: false}
+func periodWindowFrom(name string, raw *windowRaw, now time.Time) (Window, error) {
+	window, err := rawWindowFrom(name, raw)
+	if err != nil {
+		return Window{}, err
+	}
+	budget := computeBudget(window, now)
+	if !budget.Valid {
+		return Window{}, fmt.Errorf("fenêtre %s invalide: reset hors période active", name)
+	}
+	window.Budget = &budget
+	return window, nil
+}
 
+// computeBudget reproduces the dashboard pace math. A reset is valid only
+// while now belongs to the corresponding active weekly/monthly period.
+func computeBudget(w Window, now time.Time) Budget {
 	reset, err := time.Parse(time.RFC3339, w.Resets)
-	if err != nil || reset.IsZero() {
-		return b
+	if err != nil || reset.IsZero() || w.Percent < 0 || w.Percent > 100 {
+		return Budget{}
 	}
 
 	var start time.Time
@@ -212,42 +236,39 @@ func computeBudget(w Window, now time.Time) Budget {
 	case "Monthly":
 		start = monthlyStart(reset)
 	default:
-		return b // rolling: no pace maths
+		return Budget{}
+	}
+	if now.Before(start) || !now.Before(reset) {
+		return Budget{}
 	}
 
 	total := reset.Sub(start)
-	if total <= 0 {
-		return b
-	}
 	elapsed := now.Sub(start)
-	if elapsed < 0 {
-		elapsed = 0
-	}
-	if elapsed > total {
-		elapsed = total
+	if total <= 0 || elapsed < 0 || elapsed >= total {
+		return Budget{}
 	}
 
-	b.Valid = true
-	daysLeft := math.Max(0, total.Hours()/24-elapsed.Hours()/24)
-	b.DaysLeft = daysLeft
-
+	daysLeft := (total - elapsed).Hours() / 24
+	if daysLeft <= 0 || math.IsNaN(daysLeft) || math.IsInf(daysLeft, 0) {
+		return Budget{}
+	}
+	b := Budget{Valid: true, DaysLeft: daysLeft}
 	consumed := float64(w.Percent)
-	remaining := math.Max(0, 100-consumed)
+	remaining := 100 - consumed
 
 	switch {
 	case consumed >= 100:
 		b.DryDays = daysLeft
-	case elapsed.Hours()/24 > 0:
+	case elapsed.Hours() > 0 && consumed > 0:
 		ratePerDay := consumed / (elapsed.Hours() / 24)
-		if daysToWall := remaining / ratePerDay; daysToWall < daysLeft {
+		daysToWall := remaining / ratePerDay
+		if daysToWall < daysLeft {
 			b.DryDays = daysLeft - daysToWall
 		}
 	}
 	return b
 }
 
-// monthlyStart steps back one calendar month from the reset instant, keeping
-// the subscription anniversary (same clamp as the dashboard).
 func monthlyStart(reset time.Time) time.Time {
 	start := reset.AddDate(0, -1, 0)
 	if start.Day() != reset.Day() {
@@ -256,8 +277,6 @@ func monthlyStart(reset time.Time) time.Time {
 	return start
 }
 
-// WeeklyPercent returns the consumption of the "Weekly" window, or -1 when the
-// agent carries no such window (or is in error).
 func (a *Agent) WeeklyPercent() int {
 	for _, w := range a.Windows {
 		if w.Name == "Weekly" {
@@ -267,8 +286,6 @@ func (a *Agent) WeeklyPercent() int {
 	return -1
 }
 
-// MonthlyDryDays returns the number of days the monthly quota would sit at the
-// ceiling (0 = the budget holds), or -1 when unknown.
 func (a *Agent) MonthlyDryDays() float64 {
 	for _, w := range a.Windows {
 		if w.Name == "Monthly" && w.Budget != nil && w.Budget.Valid {
@@ -278,10 +295,6 @@ func (a *Agent) MonthlyDryDays() float64 {
 	return -1
 }
 
-// WeeklyDryDays returns the number of days the weekly quota would sit at the
-// ceiling (0 = the budget holds), or -1 when unknown. The weekly is a
-// blocker, not a loss: when it hits the ceiling the key stops serving, so the
-// engine anticipates it.
 func (a *Agent) WeeklyDryDays() float64 {
 	for _, w := range a.Windows {
 		if w.Name == "Weekly" && w.Budget != nil && w.Budget.Valid {
@@ -291,8 +304,6 @@ func (a *Agent) WeeklyDryDays() float64 {
 	return -1
 }
 
-// MonthlyPercent returns the raw monthly consumption (0-100), or -1 when the
-// agent carries no monthly window (or is in error).
 func (a *Agent) MonthlyPercent() int {
 	for _, w := range a.Windows {
 		if w.Name == "Monthly" {
@@ -302,8 +313,6 @@ func (a *Agent) MonthlyPercent() int {
 	return -1
 }
 
-// MonthlyDaysLeft returns the number of days remaining until the monthly
-// reset (anniversary), or -1 when unknown.
 func (a *Agent) MonthlyDaysLeft() float64 {
 	for _, w := range a.Windows {
 		if w.Name == "Monthly" && w.Budget != nil && w.Budget.Valid {
@@ -324,16 +333,7 @@ func readResponseBody(r io.Reader) ([]byte, error) {
 	return body, nil
 }
 
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "..."
-}
-
-// LabelsFromValueRefs maps a Bifrost key value ref (e.g.
-// "env.OPENCODE_GO_API_KEY_A") to the display label, mirroring the dashboard:
-// "env.OPENCODE_GO_API_KEY" is "Main", a suffix is the label.
+// LabelsFromValueRefs maps valid Bifrost env refs to subscription labels.
 func LabelsFromValueRefs(refs []string) map[string]bool {
 	const prefix = "env.OPENCODE_GO_API_KEY"
 	const separator = prefix + "_"
