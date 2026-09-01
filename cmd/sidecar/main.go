@@ -10,7 +10,9 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -29,19 +31,30 @@ type config struct {
 	DryRun     bool
 }
 
-func loadConfig() config {
+func loadConfig() (config, error) {
+	bifrostURL, err := envURL("BIFROST_URL", "http://127.0.0.1:8080")
+	if err != nil {
+		return config{}, err
+	}
+	interval, err := envDuration("INTERVAL", time.Hour)
+	if err != nil {
+		return config{}, err
+	}
 	return config{
-		BifrostURL: envOr("BIFROST_URL", "http://127.0.0.1:8080"),
-		Interval:   envDurationOr("INTERVAL", time.Hour),
+		BifrostURL: bifrostURL,
+		Interval:   interval,
 		Pinned:     envSetOr("PINNED_KEYS", nil),
 		DryRun:     envBoolOr("DRY_RUN", false),
-	}
+	}, nil
 }
 
 func main() {
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("configuration invalide: %v", err)
+	}
 	log.Printf("sidecar: bifrost=%s interval=%s pinned=%v dry_run=%v policy=cramer-monthly (weekly=bloqueur, secours >= 2)",
-		cfg.BifrostURL, cfg.Interval, cfg.Pinned, cfg.DryRun)
+		urlForLog(cfg.BifrostURL), cfg.Interval, cfg.Pinned, cfg.DryRun)
 
 	bf := bifrost.NewClient(cfg.BifrostURL, 5*time.Second)
 	qu := quotas.NewClient(5 * time.Second)
@@ -60,30 +73,65 @@ func main() {
 			return
 		}
 
+		quotaErrors := 0
+		for _, agent := range agents {
+			if agent.Error != "" {
+				quotaErrors++
+				log.Printf("quota %s KO: %s", agent.Label, agent.Error)
+			}
+		}
+
 		changes := engine.Compute(pol, engine.Input{Keys: keys, Agents: agents})
 		if len(changes) == 0 {
-			log.Printf("cycle OK: %d clés, aucun changement de poids", len(keys))
+			if quotaErrors > 0 {
+				log.Printf("cycle dégradé: %d clés, %d quota(s) indisponible(s), aucun changement de poids", len(keys), quotaErrors)
+			} else {
+				log.Printf("cycle OK: %d clés, aucun changement de poids", len(keys))
+			}
 			return
 		}
 
+		// Refresh the Bifrost snapshot after quota collection. SetWeight must
+		// send a full key object, so using fresh models and secret references
+		// narrows the window in which a concurrent management change is lost.
+		if !cfg.DryRun {
+			freshKeys, err := bf.Keys()
+			if err != nil {
+				log.Printf("cycle KO: relecture bifrost avant écriture: %v", err)
+				return
+			}
+			changes = engine.Compute(pol, engine.Input{Keys: freshKeys, Agents: agents})
+			if len(changes) == 0 {
+				if quotaErrors > 0 {
+					log.Printf("cycle dégradé: état Bifrost actualisé, %d quota(s) indisponible(s), aucun changement de poids", quotaErrors)
+				} else {
+					log.Printf("cycle OK: état Bifrost actualisé, aucun changement de poids")
+				}
+				return
+			}
+		}
+
+		failed := 0
 		for _, ch := range changes {
 			if cfg.DryRun {
-				log.Printf("[dry-run] %s: poids %.0f -> %.0f", ch.Key.Name, ch.From, ch.To)
+				log.Printf("[dry-run] %s: poids %.3f -> %.3f", ch.Key.Name, ch.From, ch.To)
 				continue
 			}
 			if err := bf.SetWeight(ch.Key, ch.To); err != nil {
+				failed++
 				log.Printf("ERREUR %s: %v", ch.Key.Name, err)
 				continue
 			}
-			log.Printf("%s: poids %.0f -> %.0f", ch.Key.Name, ch.From, ch.To)
+			log.Printf("%s: poids %.3f -> %.3f", ch.Key.Name, ch.From, ch.To)
+		}
+		if failed > 0 || quotaErrors > 0 {
+			log.Printf("cycle dégradé: %d erreur(s) quota, %d mise(s) à jour échouée(s)", quotaErrors, failed)
 		}
 	}
 
-	run() // première passe immédiate, puis ticker
-	ticker := time.NewTicker(cfg.Interval)
-	defer ticker.Stop()
-	for range ticker.C {
+	for {
 		run()
+		time.Sleep(cfg.Interval)
 	}
 }
 
@@ -98,6 +146,7 @@ func openCodeKeysFromEnv() quotas.Keys {
 	sort.Strings(envs)
 	for _, kv := range envs {
 		name, value, ok := strings.Cut(kv, "=")
+		value = strings.TrimSpace(value)
 		if !ok || value == "" {
 			continue
 		}
@@ -109,7 +158,7 @@ func openCodeKeysFromEnv() quotas.Keys {
 		}
 		if strings.HasPrefix(name, prefix+"_") {
 			label := strings.TrimPrefix(name, prefix+"_")
-			if !seen[label] {
+			if label != "" && !seen[label] {
 				keys[label] = value
 				seen[label] = true
 			}
@@ -120,24 +169,34 @@ func openCodeKeysFromEnv() quotas.Keys {
 
 // -- helpers env -- //
 
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+func envURL(key, def string) (string, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		raw = def
 	}
-	return def
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Opaque != "" || parsed.Host == "" ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("%s: URL HTTP(S) absolue sans query ni fragment attendue", key)
+	}
+	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
-func envIntOr(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
+func urlForLog(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Opaque != "" || parsed.Host == "" ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "<URL invalide>"
 	}
-	return def
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
 }
 
 func envBoolOr(key string, def bool) bool {
-	if v := os.Getenv(key); v != "" {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			return b
 		}
@@ -145,13 +204,19 @@ func envBoolOr(key string, def bool) bool {
 	return def
 }
 
-func envDurationOr(key string, def time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
+func envDuration(key string, def time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
 	}
-	return def
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s=%q: durée invalide: %w", key, v, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s=%q: la durée doit être strictement positive", key, v)
+	}
+	return d, nil
 }
 
 func envSetOr(key string, def map[string]bool) map[string]bool {

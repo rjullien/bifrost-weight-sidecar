@@ -14,12 +14,19 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
 // apiURL is the OpenCode Go usage endpoint. Variable so tests can redirect it.
 var apiURL = "https://opencode.ai/zen/go/v1/usage"
+
+const (
+	maxConcurrentRequests = 4
+	maxResponseBody       = 1 << 20 // 1 MiB
+)
 
 // Agent is one subscription as exposed by the OpenCode Go API, enriched with
 // the local budget computation.
@@ -77,21 +84,47 @@ type Keys map[string]string
 // Usage fetches the quota position of every given key, directly from the
 // OpenCode Go API. A key that fails to fetch yields an Agent carrying Error.
 func (c *Client) Usage(keys Keys) []Agent {
-	var agents []Agent
-	for label, key := range keys {
-		a := Agent{Label: label}
-		windows, err := c.fetchKey(key)
-		if err != nil {
-			a.Error = err.Error()
-		} else {
-			a.Windows = windows
-		}
-		agents = append(agents, a)
+	labels := make([]string, 0, len(keys))
+	for label := range keys {
+		labels = append(labels, label)
 	}
+	sort.Strings(labels)
+
+	agents := make([]Agent, len(labels))
+	jobs := make(chan int)
+	workers := min(maxConcurrentRequests, len(labels))
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				label := labels[i]
+				a := Agent{Label: label}
+				windows, err := c.fetchKey(keys[label])
+				if err != nil {
+					a.Error = err.Error()
+				} else {
+					a.Windows = windows
+				}
+				agents[i] = a
+			}
+		}()
+	}
+	for i := range labels {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
 	return agents
 }
 
 func (c *Client) fetchKey(apiKey string) ([]Window, error) {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return nil, fmt.Errorf("clé OpenCode vide")
+	}
+
 	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
 	if err != nil {
 		return nil, err
@@ -106,7 +139,7 @@ func (c *Client) fetchKey(apiKey string) ([]Window, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponseBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("lecture réponse API: %w", err)
 	}
@@ -280,6 +313,17 @@ func (a *Agent) MonthlyDaysLeft() float64 {
 	return -1
 }
 
+func readResponseBody(r io.Reader) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, maxResponseBody+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxResponseBody {
+		return nil, fmt.Errorf("réponse trop volumineuse (limite %d octets)", maxResponseBody)
+	}
+	return body, nil
+}
+
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s
@@ -292,16 +336,16 @@ func truncate(s string, max int) string {
 // "env.OPENCODE_GO_API_KEY" is "Main", a suffix is the label.
 func LabelsFromValueRefs(refs []string) map[string]bool {
 	const prefix = "env.OPENCODE_GO_API_KEY"
+	const separator = prefix + "_"
 	out := make(map[string]bool)
 	for _, ref := range refs {
-		if !strings.HasPrefix(ref, prefix) {
-			continue
-		}
-		suffix := strings.TrimPrefix(ref, prefix)
-		if suffix == "" {
+		switch {
+		case ref == prefix:
 			out["Main"] = true
-		} else {
-			out[strings.TrimPrefix(suffix, "_")] = true
+		case strings.HasPrefix(ref, separator):
+			if label := strings.TrimPrefix(ref, separator); label != "" {
+				out[label] = true
+			}
 		}
 	}
 	return out
