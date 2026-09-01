@@ -90,8 +90,9 @@ func Compute(cfg Config, in Input) []Change {
 	}
 
 	// Step 2: guarantee the fallback pool — MinActive keys must keep a
-	// non-zero weight. Keys with the highest urgency (most to burn before
-	// expiry) are raised first.
+	// non-zero weight. Mettre toutes les clés à 0 tue le provider entier :
+	// on garde toujours 2 clés vivantes, la première à 1 et la seconde à
+	// 0.5 (poids faible mais non nul), réarmées par urgence décroissante.
 	active := 0
 	for _, t := range targets {
 		if t.weight > 0 {
@@ -101,7 +102,7 @@ func Compute(cfg Config, in Input) []Change {
 	if active < cfg.MinActive {
 		// Sort candidates by urgency descending so the most urgent keys
 		// become the fallback pool.
-		for i := 0; i < len(targets)-1 && active < cfg.MinActive; i++ {
+		for i := 0; i < len(targets)-1; i++ {
 			for j := i + 1; j < len(targets); j++ {
 				ui, _ := urgency(byLabel[quotasLabel(targets[i].key)])
 				uj, _ := urgency(byLabel[quotasLabel(targets[j].key)])
@@ -109,15 +110,22 @@ func Compute(cfg Config, in Input) []Change {
 					targets[i], targets[j] = targets[j], targets[i]
 				}
 			}
-			if targets[i].weight <= 0 {
-				agent := byLabel[quotasLabel(targets[i].key)]
-				if agent != nil {
-					if u, ok := urgency(agent); ok && u > 0 {
-						targets[i].weight = u
-						active++
-					}
-				}
+		}
+		// Re-arm dead keys until MinActive are alive: first at 1, second
+		// at 0.5 — a live spare carrying little traffic, never 0. A key
+		// killed by Bifrost health (rule 1) is NOT re-armed: it is really
+		// dead, pushing traffic to it would fail requests.
+		fallbackWeights := []float64{1, 0.5}
+		for i := 0; i < len(targets) && active < cfg.MinActive; i++ {
+			if targets[i].weight > 0 || targets[i].key.Status != "success" {
+				continue
 			}
+			idx := active
+			if idx >= len(fallbackWeights) {
+				break
+			}
+			targets[i].weight = fallbackWeights[idx]
+			active++
 		}
 	}
 

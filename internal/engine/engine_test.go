@@ -172,32 +172,48 @@ func TestComputePinsByIdToo(t *testing.T) {
 }
 
 // Even when every key is projected dry (weekly or monthly), MinActive keys
-// must keep a non-zero weight: the pool never loses its spare. A key blocked
-// by the weekly (but with burnable monthly quota left) is re-armed as the
-// fallback.
+// must keep a non-zero weight: the pool never loses its spare. Re-armed keys
+// get 1 then 0.5 (a live spare carrying little traffic, never 0).
 func TestComputeKeepsAtLeastMinActiveKeysAsFallback(t *testing.T) {
 	cfg := Config{}
 	agents := healthyAgents()
-	// Main blocked by weekly (monthly still has quota to burn → re-armed),
-	// R and A at the monthly ceiling (nothing left → stay 0), N healthy.
-	agents[0] = agent("Main", 95, 0, 1, 95, 2) // urgency 5/1 = 5 → re-armed to 5
-	agents[1] = agent("R", 100, 4, 4, 50, 0)
-	agents[2] = agent("A", 100, 4, 4, 50, 0)
+	// All 4 keys blocked (weekly dry for 3, monthly ceiling for 1) → the
+	// fallback must resurrect 2 of them: Main at 1, N at 0.5.
+	agents[0] = agent("Main", 95, 0, 1, 95, 2) // weekly dry
+	agents[1] = agent("R", 100, 4, 4, 95, 2)   // weekly dry + monthly ceiling
+	agents[2] = agent("A", 40, 0, 20, 95, 2)   // weekly dry
+	agents[3] = agent("N", 100, 4, 4, 95, 2)   // weekly dry + monthly ceiling
 
 	changes := Compute(cfg, Input{Keys: healthyKeys(), Agents: agents})
-	to := map[string]float64{}
+	// État final : poids initial (1) + changements appliqués.
+	final := map[string]float64{}
+	for _, k := range healthyKeys() {
+		final[k.Name] = k.Weight
+	}
 	for _, c := range changes {
-		to[c.Key.Name] = c.To
+		final[c.Key.Name] = c.To
 	}
-	if to["opencode-go-key-1"] != 5 {
-		t.Errorf("Main to = %v, want 5 (fallback: burnable monthly, re-armed to its urgency)", to["opencode-go-key-1"])
+	// Two keys must be alive: one at 1, one at 0.5.
+	var weights []float64
+	for _, v := range final {
+		if v > 0 {
+			weights = append(weights, v)
+		}
 	}
-	if to["opencode-go-key-2"] != 0 || to["opencode-go-key-3"] != 0 {
-		t.Errorf("R/A to = %v/%v, want 0 (monthly ceiling, nothing to burn)", to["opencode-go-key-2"], to["opencode-go-key-3"])
+	if len(weights) < 2 {
+		t.Fatalf("final weights = %v, want >= 2 alive keys (1 and 0.5)", weights)
 	}
-	// N healthy → keeps urgency 1 (no change needed, already 1).
-	if _, ok := to["opencode-go-key-4"]; ok {
-		t.Errorf("N changed to %v, want no change (already at urgency 1)", to["opencode-go-key-4"])
+	hasOne, hasHalf := false, false
+	for _, w := range weights {
+		if w == 1 {
+			hasOne = true
+		}
+		if w == 0.5 {
+			hasHalf = true
+		}
+	}
+	if !hasOne || !hasHalf {
+		t.Errorf("final weights = %v, want one key at 1 and one at 0.5", weights)
 	}
 }
 

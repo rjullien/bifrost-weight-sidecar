@@ -45,9 +45,11 @@ d'une clé reflète l'urgence de consommation :
 clé « crame » son quota avant qu'il soit perdu). Bifrost route en proportion
 des poids (float acceptés — vérifié runtime).
 
-**Secours** : au moins **2 clés** gardent toujours un poids non nul (pool de
-fallback), réarmées par urgence décroissante — le pool ne reste jamais sans
-seconde clé disponible.
+**Secours** : au moins **2 clés** gardent toujours un poids non nul — la
+première à **1**, la seconde à **0.5** (réserve vivante, peu de trafic mais
+disponible, jamais 0). Mettre toutes les clés à 0 tuerait le provider entier.
+Les clés mortes côté Bifrost (status != success) ne sont **pas** réarmées
+(elles sont vraiment mortes).
 
 Une clé dont les quotas ne sont **pas évaluables** (absente de l'API, ou agent
 en erreur) est laissée **intacte** : jamais de décision sur données incomplètes.
