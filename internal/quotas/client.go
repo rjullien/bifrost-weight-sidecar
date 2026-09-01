@@ -41,8 +41,9 @@ type Window struct {
 // Budget is the pace computation for a period-based window, reproduced from
 // the dashboard's internal/opencode/budget.go.
 type Budget struct {
-	Valid   bool    `json:"valid"`
-	DryDays float64 `json:"dryDays"`
+	Valid    bool    `json:"valid"`
+	DryDays  float64 `json:"dryDays"`
+	DaysLeft float64 `json:"daysLeft,omitempty"`
 }
 
 // apiResponse matches the real OpenCode Go API response format.
@@ -195,6 +196,7 @@ func computeBudget(w Window, now time.Time) Budget {
 
 	b.Valid = true
 	daysLeft := math.Max(0, total.Hours()/24-elapsed.Hours()/24)
+	b.DaysLeft = daysLeft
 
 	consumed := float64(w.Percent)
 	remaining := math.Max(0, 100-consumed)
@@ -238,6 +240,41 @@ func (a *Agent) MonthlyDryDays() float64 {
 	for _, w := range a.Windows {
 		if w.Name == "Monthly" && w.Budget != nil && w.Budget.Valid {
 			return w.Budget.DryDays
+		}
+	}
+	return -1
+}
+
+// WeeklyDryDays returns the number of days the weekly quota would sit at the
+// ceiling (0 = the budget holds), or -1 when unknown. The weekly is a
+// blocker, not a loss: when it hits the ceiling the key stops serving, so the
+// engine anticipates it.
+func (a *Agent) WeeklyDryDays() float64 {
+	for _, w := range a.Windows {
+		if w.Name == "Weekly" && w.Budget != nil && w.Budget.Valid {
+			return w.Budget.DryDays
+		}
+	}
+	return -1
+}
+
+// MonthlyPercent returns the raw monthly consumption (0-100), or -1 when the
+// agent carries no monthly window (or is in error).
+func (a *Agent) MonthlyPercent() int {
+	for _, w := range a.Windows {
+		if w.Name == "Monthly" {
+			return w.Percent
+		}
+	}
+	return -1
+}
+
+// MonthlyDaysLeft returns the number of days remaining until the monthly
+// reset (anniversary), or -1 when unknown.
+func (a *Agent) MonthlyDaysLeft() float64 {
+	for _, w := range a.Windows {
+		if w.Name == "Monthly" && w.Budget != nil && w.Budget.Valid {
+			return w.Budget.DaysLeft
 		}
 	}
 	return -1

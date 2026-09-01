@@ -23,31 +23,29 @@ import (
 )
 
 type config struct {
-	BifrostURL      string
-	Interval        time.Duration
-	WeeklyThreshold int
-	Pinned          map[string]bool
-	DryRun          bool
+	BifrostURL string
+	Interval   time.Duration
+	Pinned     map[string]bool
+	DryRun     bool
 }
 
 func loadConfig() config {
 	return config{
-		BifrostURL:      envOr("BIFROST_URL", "http://127.0.0.1:8080"),
-		Interval:        envDurationOr("INTERVAL", time.Hour),
-		WeeklyThreshold: envIntOr("WEEKLY_THRESHOLD", 80),
-		Pinned:          envSetOr("PINNED_KEYS", nil),
-		DryRun:          envBoolOr("DRY_RUN", false),
+		BifrostURL: envOr("BIFROST_URL", "http://127.0.0.1:8080"),
+		Interval:   envDurationOr("INTERVAL", time.Hour),
+		Pinned:     envSetOr("PINNED_KEYS", nil),
+		DryRun:     envBoolOr("DRY_RUN", false),
 	}
 }
 
 func main() {
 	cfg := loadConfig()
-	log.Printf("sidecar: bifrost=%s interval=%s weekly_threshold=%d%% pinned=%v dry_run=%v",
-		cfg.BifrostURL, cfg.Interval, cfg.WeeklyThreshold, cfg.Pinned, cfg.DryRun)
+	log.Printf("sidecar: bifrost=%s interval=%s pinned=%v dry_run=%v policy=cramer-monthly (weekly=bloqueur, secours >= 2)",
+		cfg.BifrostURL, cfg.Interval, cfg.Pinned, cfg.DryRun)
 
 	bf := bifrost.NewClient(cfg.BifrostURL, 5*time.Second)
 	qu := quotas.NewClient(5 * time.Second)
-	pol := engine.Config{WeeklyThreshold: cfg.WeeklyThreshold, Pinned: cfg.Pinned}
+	pol := engine.Config{Pinned: cfg.Pinned, MinActive: 2}
 
 	run := func() {
 		keys, err := bf.Keys()

@@ -122,3 +122,21 @@ func (a *Agent) hasWindow(name string) bool {
 	}
 	return false
 }
+func TestNewAccessors(t *testing.T) {
+	agents := []Agent{
+		{Label: "X", Windows: []Window{
+			{Name: "Monthly", Percent: 80, Budget: &Budget{Valid: true, DryDays: 0, DaysLeft: 5}},
+			{Name: "Weekly", Percent: 90, Budget: &Budget{Valid: true, DryDays: 1.5}},
+		}},
+	}
+	a := &agents[0]
+	if got := a.MonthlyPercent(); got != 80 {
+		t.Errorf("MonthlyPercent = %d, want 80", got)
+	}
+	if got := a.MonthlyDaysLeft(); got != 5 {
+		t.Errorf("MonthlyDaysLeft = %v, want 5", got)
+	}
+	if got := a.WeeklyDryDays(); got != 1.5 {
+		t.Errorf("WeeklyDryDays = %v, want 1.5", got)
+	}
+}
