@@ -13,7 +13,7 @@ chargement des clés en fonction des quotas OpenCode Go.
 À chaque cycle (toutes les `INTERVAL`) :
 
 1. `GET /api/providers/opencode-go/keys` → poids actuels + statut de chaque clé
-2. `GET https://opencode.ai/zen/go/v1/usage` par clé → quotas **directement**
+2. `GET https://opencode.ai/zen/go/v1/usage` par clé, avec au plus **4 requêtes simultanées** → quotas **directement**
    depuis l'API OpenCode Go (les clés `OPENCODE_GO_API_KEY*` sont injectées
    dans l'environnement du sidecar)
 3. Calcul local du budget (weekly % + projection mensuelle à sec) — **sans**
@@ -45,11 +45,13 @@ d'une clé reflète l'urgence de consommation :
 clé « crame » son quota avant qu'il soit perdu). Bifrost route en proportion
 des poids (float acceptés — vérifié runtime).
 
-**Secours** : au moins **2 clés** gardent toujours un poids non nul — la
-première à **1**, la seconde à **0.5** (réserve vivante, peu de trafic mais
-disponible, jamais 0). Mettre toutes les clés à 0 tuerait le provider entier.
-Les clés mortes côté Bifrost (status != success) ne sont **pas** réarmées
-(elles sont vraiment mortes).
+**Secours** : le contrôleur essaie de garder au moins **2 clés utilisables** avec
+un poids non nul — la première à **1**, les suivantes à **0.5** (réserve
+vivante, peu de trafic mais disponible). Les clés mortes côté Bifrost
+(`status != success`) ou sans quota mensuel restant ne sont **jamais**
+réarmées : si moins de deux clés peuvent réellement servir, le contrôleur
+préfère laisser le pool dégradé plutôt que leur envoyer du trafic voué à
+échouer.
 
 Une clé dont les quotas ne sont **pas évaluables** (absente de l'API, ou agent
 en erreur) est laissée **intacte** : jamais de décision sur données incomplètes.
@@ -58,8 +60,8 @@ en erreur) est laissée **intacte** : jamais de décision sur données incomplè
 
 | Variable | Défaut | Description |
 |----------|--------|-------------|
-| `BIFROST_URL` | `http://127.0.0.1:8080` | Base URL du gateway Bifrost (localhost IPv4 quand sidecar dans le pod) |
-| `INTERVAL` | `1h` | Durée entre deux cycles (`30m`, `45s`, …) |
+| `BIFROST_URL` | `http://127.0.0.1:8080` | URL HTTP(S) absolue du gateway Bifrost, sans query ni fragment (localhost IPv4 quand sidecar dans le pod) |
+| `INTERVAL` | `1h` | Durée strictement positive entre la fin d’un cycle et le suivant (`30m`, `45s`, …) |
 | `PINNED_KEYS` | *(vide)* | Clés à ne JAMAIS toucher, séparées par des virgules (nom ou id) |
 | `DRY_RUN` | `false` | Log les changements sans les appliquer |
 | `OPENCODE_GO_API_KEY*` | *(requis)* | Clés OpenCode Go à surveiller : `OPENCODE_GO_API_KEY` = Main, `OPENCODE_GO_API_KEY_A` = A, etc. |
@@ -72,6 +74,13 @@ Sidecar du pod Bifrost (même réseau → `http://127.0.0.1:8080`) :
 containers:
   - name: bifrost-weights
     image: ghcr.io/rjullien/bifrost-weight-sidecar:main
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
     env:
       - name: BIFROST_URL
         value: http://127.0.0.1:8080
@@ -83,7 +92,6 @@ containers:
 ## Test local (dry-run)
 
 ```bash
-go run ./cmd/sidecar
-# avec BIFROST_URL et DASHBOARD_URL par défaut (cluster) en --dry-run :
+# utilise BIFROST_URL=http://127.0.0.1:8080 par défaut
 DRY_RUN=true go run ./cmd/sidecar
 ```

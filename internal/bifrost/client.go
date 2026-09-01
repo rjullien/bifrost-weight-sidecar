@@ -8,12 +8,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
 // provider is the only provider this sidecar manages.
 const provider = "opencode-go"
+
+// Keep management API responses below the pod's memory budget. Error bodies
+// are truncated for logs, but must be bounded before they are read in full.
+const maxResponseBody = 1 << 20 // 1 MiB
 
 // Key is one provider key as exposed by GET /api/providers/{provider}/keys.
 type Key struct {
@@ -23,6 +28,27 @@ type Key struct {
 	Models []string  `json:"models"`
 	Weight float64   `json:"weight"`
 	Status string    `json:"status"`
+
+	// fields retains the complete redacted object returned by Bifrost. Its PUT
+	// endpoint replaces configuration fields, so SetWeight must forward fields
+	// this sidecar does not interpret (blacklists, aliases, flags and future
+	// additions) instead of silently resetting them.
+	fields map[string]json.RawMessage
+}
+
+func (k *Key) UnmarshalJSON(data []byte) error {
+	type wireKey Key
+	var decoded wireKey
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*k = Key(decoded)
+	k.fields = fields
+	return nil
 }
 
 // SecretRef carries the source of a key value ("env.VAR"). The resolved
@@ -67,7 +93,7 @@ func (c *Client) Keys() ([]Key, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponseBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("lecture réponse bifrost: %w", err)
 	}
@@ -83,22 +109,27 @@ func (c *Client) Keys() ([]Key, error) {
 }
 
 // SetWeight changes the load-balancing weight of one key. The payload mirrors
-// what the Bifrost UI sends: the full key object with its env reference (never
-// the masked secret preview) and its model list — the update endpoint replaces
-// fields rather than merging them, so a partial payload would wipe them.
+// the complete redacted object returned by Bifrost, while replacing the masked
+// secret preview with its environment reference. The update endpoint replaces
+// fields rather than merging them, so forwarding unknown configuration fields
+// is required to preserve blacklists, aliases, flags and future additions.
 func (c *Client) SetWeight(key Key, weight float64) error {
 	models := key.Models
 	if len(models) == 0 {
 		models = []string{"*"}
 	}
 
-	payload := map[string]any{
-		"id":     key.ID,
-		"name":   key.Name,
-		"value":  SecretRef{Ref: key.Value.Ref, Type: key.Value.Type},
-		"models": models,
-		"weight": weight,
+	payload := make(map[string]any, len(key.fields)+5)
+	for name, value := range key.fields {
+		payload[name] = value
 	}
+	// Always override the fields managed by this sidecar. In particular, never
+	// send the masked secret preview returned by the management API.
+	payload["id"] = key.ID
+	payload["name"] = key.Name
+	payload["value"] = SecretRef{Ref: key.Value.Ref, Type: key.Value.Type}
+	payload["models"] = models
+	payload["weight"] = weight
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -106,7 +137,7 @@ func (c *Client) SetWeight(key Key, weight float64) error {
 	}
 
 	req, err := http.NewRequest(http.MethodPut,
-		c.baseURL+"/api/providers/"+provider+"/keys/"+key.ID, bytes.NewReader(body))
+		c.baseURL+"/api/providers/"+provider+"/keys/"+url.PathEscape(key.ID), bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -118,7 +149,7 @@ func (c *Client) SetWeight(key Key, weight float64) error {
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readResponseBody(resp.Body)
 	if err != nil {
 		return fmt.Errorf("lecture réponse bifrost: %w", err)
 	}
@@ -126,6 +157,17 @@ func (c *Client) SetWeight(key Key, weight float64) error {
 		return fmt.Errorf("bifrost HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 200))
 	}
 	return nil
+}
+
+func readResponseBody(r io.Reader) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, maxResponseBody+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxResponseBody {
+		return nil, fmt.Errorf("réponse trop volumineuse (limite %d octets)", maxResponseBody)
+	}
+	return body, nil
 }
 
 func truncate(s string, max int) string {

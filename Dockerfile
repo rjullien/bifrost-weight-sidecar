@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.0-alpine AS builder
 
 WORKDIR /src
 
@@ -19,5 +19,7 @@ FROM scratch
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /sidecar /sidecar
+
+USER 65532:65532
 
 ENTRYPOINT ["/sidecar"]

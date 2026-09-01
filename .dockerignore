@@ -1,0 +1,6 @@
+.git
+.github
+.kiro
+sidecar
+*.test
+*.out

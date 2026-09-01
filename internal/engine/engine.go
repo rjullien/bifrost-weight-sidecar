@@ -48,6 +48,9 @@ type Input struct {
 // urgency is the monthly burn rate: how much monthly quota (percent) remains
 // per day until the reset. The higher, the more the key must be pushed.
 func urgency(agent *quotas.Agent) (float64, bool) {
+	if agent == nil {
+		return 0, false
+	}
 	pct := agent.MonthlyPercent()
 	days := agent.MonthlyDaysLeft()
 	if pct < 0 || days < 0 || days <= 0 {
@@ -120,24 +123,20 @@ func Compute(cfg Config, in Input) []Change {
 		// MinActive are alive: first at 1, second at 0.5 — a live spare
 		// carrying little traffic, never 0. Keys killed by Bifrost health or
 		// with no monthly quota left are NOT re-armed: they would fail.
-		fallbackWeights := []float64{1, 0.5}
 		for i := 0; i < len(targets) && active < cfg.MinActive; i++ {
 			if targets[i].weight > 0 || targets[i].key.Status != "success" {
 				continue
 			}
 			agent := byLabel[quotasLabel(targets[i].key)]
-			if agent == nil {
-				continue
-			}
 			u, ok := urgency(agent)
 			if !ok || u <= 0 {
 				continue // no monthly quota left to burn: really dead
 			}
-			idx := active
-			if idx >= len(fallbackWeights) {
-				break
+			if active == 0 {
+				targets[i].weight = 1
+			} else {
+				targets[i].weight = 0.5
 			}
-			targets[i].weight = fallbackWeights[idx]
 			active++
 		}
 	}
@@ -169,7 +168,7 @@ func quotasLabel(key bifrost.Key) string {
 func targetWeight(cfg Config, key bifrost.Key, byLabel map[string]*quotas.Agent) float64 {
 	// Rule 1: Bifrost's own key health. Applies even when the quota data
 	// is missing for this key.
-	if key.Status != "" && key.Status != "success" {
+	if key.Status != "success" {
 		return 0
 	}
 
@@ -204,12 +203,16 @@ func targetWeight(cfg Config, key bifrost.Key, byLabel map[string]*quotas.Agent)
 // is the "A" subscription, "env.OPENCODE_GO_API_KEY" is "Main".
 func LabelFromEnv(ref string) string {
 	const prefix = "env.OPENCODE_GO_API_KEY"
-	if !strings.HasPrefix(ref, prefix) {
-		return ""
-	}
-	suffix := strings.TrimPrefix(ref, prefix)
-	if suffix == "" {
+	if ref == prefix {
 		return "Main"
 	}
-	return strings.TrimPrefix(suffix, "_")
+	const separator = prefix + "_"
+	if !strings.HasPrefix(ref, separator) {
+		return ""
+	}
+	label := strings.TrimPrefix(ref, separator)
+	if label == "" {
+		return ""
+	}
+	return label
 }
