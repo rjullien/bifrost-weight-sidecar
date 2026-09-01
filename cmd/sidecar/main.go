@@ -25,11 +25,20 @@ import (
 )
 
 type config struct {
-	BifrostURL string
-	Interval   time.Duration
-	Pinned     map[string]bool
-	DryRun     bool
+	BifrostURL   string
+	Interval     time.Duration
+	RetryBackoff time.Duration
+	Pinned       map[string]bool
+	DryRun       bool
 }
+
+const (
+	// retryBackoffStart : délai initial après un échec de connexion à Bifrost.
+	retryBackoffStart = 15 * time.Second
+	// maxRetryBackoff : plafond du backoff exponentiel (bootstrap bifrost v2 ~35s,
+	// 3 essais ≈ 15+30+60s → couvre largement).
+	maxRetryBackoff = 5 * time.Minute
+)
 
 func loadConfig() (config, error) {
 	bifrostURL, err := envURL("BIFROST_URL", "http://127.0.0.1:8080")
@@ -40,11 +49,18 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	retryBackoff := retryBackoffStart
+	if v, err := envDuration("RETRY_BACKOFF", retryBackoffStart); err == nil {
+		retryBackoff = v
+	} else {
+		return config{}, err
+	}
 	return config{
-		BifrostURL: bifrostURL,
-		Interval:   interval,
-		Pinned:     envSetOr("PINNED_KEYS", nil),
-		DryRun:     envBoolOr("DRY_RUN", false),
+		BifrostURL:   bifrostURL,
+		Interval:     interval,
+		RetryBackoff: retryBackoff,
+		Pinned:       envSetOr("PINNED_KEYS", nil),
+		DryRun:       envBoolOr("DRY_RUN", false),
 	}, nil
 }
 
@@ -60,17 +76,17 @@ func main() {
 	qu := quotas.NewClient(5 * time.Second)
 	pol := engine.Config{Pinned: cfg.Pinned, MinActive: 2}
 
-	run := func() {
+	run := func() bool {
 		keys, err := bf.Keys()
 		if err != nil {
 			log.Printf("cycle KO: %v", err)
-			return
+			return false // bifrost injoignable → réessayer vite (backoff)
 		}
 
 		agents := qu.Usage(openCodeKeysFromEnv())
 		if len(agents) == 0 {
 			log.Printf("cycle KO: aucune clé OpenCode dans l'environnement (OPENCODE_GO_API_KEY*)")
-			return
+			return true
 		}
 
 		quotaErrors := 0
@@ -88,7 +104,7 @@ func main() {
 			} else {
 				log.Printf("cycle OK: %d clés, aucun changement de poids", len(keys))
 			}
-			return
+			return true
 		}
 
 		// Refresh the Bifrost snapshot after quota collection. SetWeight must
@@ -98,7 +114,7 @@ func main() {
 			freshKeys, err := bf.Keys()
 			if err != nil {
 				log.Printf("cycle KO: relecture bifrost avant écriture: %v", err)
-				return
+				return false
 			}
 			changes = engine.Compute(pol, engine.Input{Keys: freshKeys, Agents: agents})
 			if len(changes) == 0 {
@@ -107,7 +123,7 @@ func main() {
 				} else {
 					log.Printf("cycle OK: état Bifrost actualisé, aucun changement de poids")
 				}
-				return
+				return true
 			}
 		}
 
@@ -127,11 +143,27 @@ func main() {
 		if failed > 0 || quotaErrors > 0 {
 			log.Printf("cycle dégradé: %d erreur(s) quota, %d mise(s) à jour échouée(s)", quotaErrors, failed)
 		}
+		return true
 	}
 
+	// Boucle principale : après un échec de connexion à Bifrost (ex: bootstrap
+	// encore en cours au démarrage, ~35s sur bifrost v2), réessayer avec un
+	// backoff exponentiel au lieu de dormir l'intervalle complet. Sans ça le
+	// sidecar reste KO pendant 1h après un démarrage raté.
+	backoff := cfg.RetryBackoff
 	for {
-		run()
-		time.Sleep(cfg.Interval)
+		if run() {
+			time.Sleep(cfg.Interval)
+			continue
+		}
+		log.Printf("bifrost injoignable — prochain essai dans %s", backoff)
+		time.Sleep(backoff)
+		if backoff < maxRetryBackoff {
+			backoff *= 2
+			if backoff > maxRetryBackoff {
+				backoff = maxRetryBackoff
+			}
+		}
 	}
 }
 
