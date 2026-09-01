@@ -5,3 +5,12 @@ sidecar
 *.test
 *.out
 
+# Secrets and local credentials must never enter the Docker build context.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*
+*secret*

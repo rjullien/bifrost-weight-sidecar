@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"math"
 	"testing"
 
 	"github.com/rjullien/bifrost-weight-sidecar/internal/bifrost"
@@ -290,5 +291,155 @@ func TestComputeFallbackWithAllKeysBurned(t *testing.T) {
 		if to[name] != 0 {
 			t.Errorf("%s = %v, want 0 (clé cramée — jamais réarmée même si tout est mort)", name, to[name])
 		}
+	}
+}
+
+func TestComputeCountsPinnedActiveSubscription(t *testing.T) {
+	keys := []bifrost.Key{
+		key("main", "main", "env.OPENCODE_GO_API_KEY", 1, "success"),
+		key("a", "a", "env.OPENCODE_GO_API_KEY_A", 1, "success"),
+	}
+	agents := []quotas.Agent{
+		agent("Main", 50, 0, 10, 50, 0),
+		agent("A", 50, 0, 10, 95, 1),
+	}
+	changes := Compute(Config{Pinned: map[string]bool{"main": true}, MinActive: 1}, Input{Keys: keys, Agents: agents})
+	if len(changes) != 1 || changes[0].Key.ID != "a" || changes[0].To != 0 {
+		t.Fatalf("changes = %+v, want only A -> 0 because pinned Main already satisfies MinActive", changes)
+	}
+}
+
+func TestComputeCountsDuplicateEnvRefsOnce(t *testing.T) {
+	keys := []bifrost.Key{
+		key("main-1", "main-1", "env.OPENCODE_GO_API_KEY", 1, "success"),
+		key("main-2", "main-2", "env.OPENCODE_GO_API_KEY", 1, "success"),
+		key("a", "a", "env.OPENCODE_GO_API_KEY_A", 1, "success"),
+	}
+	agents := []quotas.Agent{
+		agent("Main", 90, 0, 10, 50, 0),
+		agent("A", 50, 0, 10, 95, 1),
+	}
+	changes := Compute(Config{MinActive: 2}, Input{Keys: keys, Agents: agents})
+	finalA := keys[2].Weight
+	for _, change := range changes {
+		if change.Key.ID == "a" {
+			finalA = change.To
+		}
+	}
+	if finalA != 0.5 {
+		t.Fatalf("A final weight = %v, want 0.5 because duplicate Main rows are one subscription", finalA)
+	}
+}
+
+func TestComputeNeverRearmsWeeklyCeiling(t *testing.T) {
+	keys := []bifrost.Key{
+		key("main", "main", "env.OPENCODE_GO_API_KEY", 1, "success"),
+		key("a", "a", "env.OPENCODE_GO_API_KEY_A", 1, "success"),
+	}
+	agents := []quotas.Agent{
+		agent("Main", 50, 0, 10, 100, 2),
+		agent("A", 50, 0, 10, 100, 2),
+	}
+	changes := Compute(Config{MinActive: 2}, Input{Keys: keys, Agents: agents})
+	if len(changes) != 2 {
+		t.Fatalf("changes = %+v, want both keys zeroed", changes)
+	}
+	for _, change := range changes {
+		if change.To != 0 {
+			t.Fatalf("change = %+v, weekly ceiling must never be re-armed", change)
+		}
+	}
+}
+
+func TestComputeMayUseProjectedWeeklyExhaustionAsFallback(t *testing.T) {
+	keys := []bifrost.Key{
+		key("main", "main", "env.OPENCODE_GO_API_KEY", 0, "success"),
+		key("a", "a", "env.OPENCODE_GO_API_KEY_A", 0, "success"),
+	}
+	agents := []quotas.Agent{
+		agent("Main", 50, 0, 10, 95, 2),
+		agent("A", 60, 0, 10, 95, 2),
+	}
+	changes := Compute(Config{MinActive: 2}, Input{Keys: keys, Agents: agents})
+	final := map[string]float64{}
+	for _, change := range changes {
+		final[change.Key.ID] = change.To
+	}
+	if final["main"] != 1 || final["a"] != 0.5 {
+		t.Fatalf("final = %v, want projected-only fallback weights 1 and 0.5", final)
+	}
+}
+
+func TestComputeTreatsDuplicateAgentLabelsAsUnknown(t *testing.T) {
+	keys := []bifrost.Key{key("main", "main", "env.OPENCODE_GO_API_KEY", 1, "success")}
+	agents := []quotas.Agent{
+		agent("Main", 100, 5, 5, 100, 5),
+		agent("Main", 50, 0, 10, 50, 0),
+	}
+	if changes := Compute(Config{MinActive: 1}, Input{Keys: keys, Agents: agents}); len(changes) != 0 {
+		t.Fatalf("changes = %+v, want ambiguous quota signal left untouched", changes)
+	}
+}
+
+func TestWeightsAreFiniteRoundedAndComparedAtPolicyPrecision(t *testing.T) {
+	if WeightsEqual(math.NaN(), 1) || WeightsEqual(math.Inf(1), 1) {
+		t.Fatal("non-finite weights must never compare equal")
+	}
+	if !WeightsEqual(1.235, 1.2354) {
+		t.Fatal("sub-half-mill precision should compare equal")
+	}
+	if WeightsEqual(1.235, 1.236) {
+		t.Fatal("one-mill difference should not compare equal")
+	}
+
+	keys := []bifrost.Key{key("main", "main", "env.OPENCODE_GO_API_KEY", 0, "success")}
+	agents := []quotas.Agent{agent("Main", 90, 0, 8.1, 50, 0)}
+	changes := Compute(Config{MinActive: 1}, Input{Keys: keys, Agents: agents})
+	if len(changes) != 1 || changes[0].To != 1.235 {
+		t.Fatalf("changes = %+v, want normalized weight 1.235", changes)
+	}
+
+	agents[0].Windows[0].Budget.DaysLeft = math.NaN()
+	if changes := Compute(Config{MinActive: 1}, Input{Keys: keys, Agents: agents}); len(changes) != 0 {
+		t.Fatalf("changes = %+v, want invalid non-finite quota left untouched", changes)
+	}
+}
+
+func boolPointer(value bool) *bool { return &value }
+
+func TestComputeDoesNotCountExplicitlyDisabledSubscriptions(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		pinned bool
+	}{
+		{name: "pinned", pinned: true},
+		{name: "quota unknown", pinned: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			disabled := key("main", "main", "env.OPENCODE_GO_API_KEY", 1, "success")
+			disabled.Enabled = boolPointer(false)
+			fallback := key("a", "a", "env.OPENCODE_GO_API_KEY_A", 0, "success")
+			cfg := Config{MinActive: 1}
+			if test.pinned {
+				cfg.Pinned = map[string]bool{"main": true}
+			}
+			agents := []quotas.Agent{agent("A", 50, 0, 10, 95, 1)}
+			changes := Compute(cfg, Input{Keys: []bifrost.Key{disabled, fallback}, Agents: agents})
+			if len(changes) != 1 || changes[0].Key.ID != "a" || changes[0].To != 1 {
+				t.Fatalf("changes = %+v, want enabled fallback A -> 1", changes)
+			}
+		})
+	}
+}
+
+func TestComputeLeavesExplicitlyDisabledManagedKeyUntouched(t *testing.T) {
+	disabled := key("main", "main", "env.OPENCODE_GO_API_KEY", 2, "success")
+	disabled.Enabled = boolPointer(false)
+	changes := Compute(Config{MinActive: 1}, Input{
+		Keys:   []bifrost.Key{disabled},
+		Agents: []quotas.Agent{agent("Main", 100, 5, 5, 100, 5)},
+	})
+	if len(changes) != 0 {
+		t.Fatalf("changes = %+v, want manually disabled key untouched", changes)
 	}
 }

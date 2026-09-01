@@ -4,35 +4,34 @@ package bifrost
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 )
 
-// provider is the only provider this sidecar manages.
-const provider = "opencode-go"
+const (
+	provider        = "opencode-go"
+	maxResponseBody = 1 << 20 // 1 MiB
+)
 
-// Keep management API responses below the pod's memory budget. Error bodies
-// are truncated for logs, but must be bounded before they are read in full.
-const maxResponseBody = 1 << 20 // 1 MiB
-
-// Key is one provider key as exposed by GET /api/providers/{provider}/keys.
+// Key is one provider key as exposed by the Bifrost management API.
 type Key struct {
-	ID     string    `json:"id"`
-	Name   string    `json:"name"`
-	Value  SecretRef `json:"value"`
-	Models []string  `json:"models"`
-	Weight float64   `json:"weight"`
-	Status string    `json:"status"`
+	ID      string    `json:"id"`
+	Name    string    `json:"name"`
+	Value   SecretRef `json:"value"`
+	Models  []string  `json:"models"`
+	Weight  float64   `json:"weight"`
+	Status  string    `json:"status"`
+	Enabled *bool     `json:"enabled,omitempty"`
 
-	// fields retains the complete redacted object returned by Bifrost. Its PUT
-	// endpoint replaces configuration fields, so SetWeight must forward fields
-	// this sidecar does not interpret (blacklists, aliases, flags and future
-	// additions) instead of silently resetting them.
+	// fields retains the complete redacted object. Bifrost PUT replaces fields,
+	// so unknown top-level configuration must be forwarded unchanged.
 	fields map[string]json.RawMessage
 }
 
@@ -51,8 +50,7 @@ func (k *Key) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// SecretRef carries the source of a key value ("env.VAR"). The resolved
-// secret is never sent back: an update only re-states the reference.
+// SecretRef carries the source of a key value (for example env.VAR).
 type SecretRef struct {
 	Value string `json:"value,omitempty"`
 	Ref   string `json:"ref,omitempty"`
@@ -69,78 +67,127 @@ type Client struct {
 	baseURL string
 }
 
-// NewClient creates a Client for the given base URL. The timeout must stay
-// short: a dead Bifrost must not stall the sidecar loop.
+// NewClient creates a short-timeout client and refuses every redirect. A 302
+// could turn a PUT into a false-success GET; 307/308 could replay configuration
+// to another origin.
 func NewClient(baseURL string, timeout time.Duration) *Client {
 	return &Client{
-		http:    &http.Client{Timeout: timeout},
+		http: &http.Client{
+			Timeout: timeout,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		baseURL: strings.TrimRight(baseURL, "/"),
 	}
 }
 
-// Keys returns the current opencode-go provider keys with their weights and
-// status.
 func (c *Client) Keys() ([]Key, error) {
-	req, err := http.NewRequest(http.MethodGet, c.baseURL+"/api/providers/"+provider+"/keys", nil)
+	return c.KeysContext(context.Background())
+}
+
+// KeysContext returns and validates the current provider snapshot.
+func (c *Client) KeysContext(ctx context.Context) ([]Key, error) {
+	body, err := c.get(ctx, c.baseURL+"/api/providers/"+provider+"/keys")
+	if err != nil {
+		return nil, err
+	}
+	var parsed keysResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("réponse bifrost invalide: %w", err)
+	}
+	for i := range parsed.Keys {
+		if err := validateKey(parsed.Keys[i]); err != nil {
+			return nil, fmt.Errorf("réponse bifrost invalide (clé %d): %w", i, err)
+		}
+	}
+	return parsed.Keys, nil
+}
+
+// KeyContext fetches a fresh single-key snapshot immediately before a PUT.
+func (c *Client) KeyContext(ctx context.Context, id string) (Key, error) {
+	if id == "" {
+		return Key{}, fmt.Errorf("id bifrost vide")
+	}
+	body, err := c.get(ctx, c.baseURL+"/api/providers/"+provider+"/keys/"+url.PathEscape(id))
+	if err != nil {
+		return Key{}, err
+	}
+	var key Key
+	if err := json.Unmarshal(body, &key); err != nil {
+		return Key{}, fmt.Errorf("réponse bifrost invalide: %w", err)
+	}
+	if err := validateKey(key); err != nil {
+		return Key{}, fmt.Errorf("réponse bifrost invalide: %w", err)
+	}
+	return key, nil
+}
+
+func (c *Client) get(ctx context.Context, endpoint string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
-
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("bifrost injoignable: %w", err)
 	}
 	defer resp.Body.Close()
-
 	body, err := readResponseBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("lecture réponse bifrost: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("bifrost HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
+		return nil, fmt.Errorf("bifrost HTTP %d", resp.StatusCode)
 	}
-
-	var parsed keysResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("réponse bifrost invalide: %w", err)
-	}
-	return parsed.Keys, nil
+	return body, nil
 }
 
-// SetWeight changes the load-balancing weight of one key. The payload mirrors
-// the complete redacted object returned by Bifrost, while replacing the masked
-// secret preview with its environment reference. The update endpoint replaces
-// fields rather than merging them, so forwarding unknown configuration fields
-// is required to preserve blacklists, aliases, flags and future additions.
 func (c *Client) SetWeight(key Key, weight float64) error {
-	models := key.Models
-	if len(models) == 0 {
-		models = []string{"*"}
+	return c.SetWeightContext(context.Background(), key, weight)
+}
+
+// SetWeightContext changes one weight from a fresh complete env-backed key.
+// Plaintext and malformed references are refused rather than risking credential
+// replacement in Bifrost's full-object PUT endpoint.
+func (c *Client) SetWeightContext(ctx context.Context, key Key, weight float64) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	if !managedEnvRef(key.Value) {
+		return fmt.Errorf("clé %q non gérée: référence env OPENCODE_GO_API_KEY requise", key.ID)
+	}
+	if weight < 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
+		return fmt.Errorf("poids invalide pour %q", key.ID)
 	}
 
 	payload := make(map[string]any, len(key.fields)+5)
 	for name, value := range key.fields {
 		payload[name] = value
 	}
-	// Always override the fields managed by this sidecar. In particular, never
-	// send the masked secret preview returned by the management API.
+	value, err := safeSecretReference(key)
+	if err != nil {
+		return err
+	}
 	payload["id"] = key.ID
 	payload["name"] = key.Name
-	payload["value"] = SecretRef{Ref: key.Value.Ref, Type: key.Value.Type}
-	payload["models"] = models
+	payload["value"] = value
+	// Preserve an empty model list. In Bifrost it means "allow none"; changing
+	// it to ["*"] would silently broaden access.
+	payload["models"] = key.Models
 	payload["weight"] = weight
 
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-
-	req, err := http.NewRequest(http.MethodPut,
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
 		c.baseURL+"/api/providers/"+provider+"/keys/"+url.PathEscape(key.ID), bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.http.Do(req)
@@ -148,15 +195,60 @@ func (c *Client) SetWeight(key Key, weight float64) error {
 		return fmt.Errorf("bifrost injoignable: %w", err)
 	}
 	defer resp.Body.Close()
-
 	respBody, err := readResponseBody(resp.Body)
 	if err != nil {
 		return fmt.Errorf("lecture réponse bifrost: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("bifrost HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 200))
+		return fmt.Errorf("bifrost HTTP %d", resp.StatusCode)
+	}
+
+	var confirmation struct {
+		ID     string   `json:"id"`
+		Weight *float64 `json:"weight"`
+	}
+	if err := json.Unmarshal(respBody, &confirmation); err != nil || confirmation.ID != key.ID ||
+		confirmation.Weight == nil || math.Abs(*confirmation.Weight-weight) >= 0.0005 {
+		return fmt.Errorf("confirmation bifrost invalide pour %q", key.ID)
 	}
 	return nil
+}
+
+func safeSecretReference(key Key) (map[string]any, error) {
+	value := make(map[string]any)
+	if raw, ok := key.fields["value"]; ok {
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return nil, fmt.Errorf("value bifrost invalide pour %q", key.ID)
+		}
+	}
+	// Never send the redacted preview. Preserve future non-secret nested fields.
+	delete(value, "value")
+	value["ref"] = key.Value.Ref
+	value["type"] = key.Value.Type
+	return value, nil
+}
+
+func managedEnvRef(value SecretRef) bool {
+	if value.Type != "env" {
+		return false
+	}
+	const prefix = "env.OPENCODE_GO_API_KEY"
+	return value.Ref == prefix || (strings.HasPrefix(value.Ref, prefix+"_") && len(value.Ref) > len(prefix)+1)
+}
+
+func validateKey(key Key) error {
+	switch {
+	case key.ID == "":
+		return fmt.Errorf("id manquant")
+	case key.Name == "":
+		return fmt.Errorf("nom manquant pour %q", key.ID)
+	case key.Status == "":
+		return fmt.Errorf("status manquant pour %q", key.ID)
+	case math.IsNaN(key.Weight) || math.IsInf(key.Weight, 0) || key.Weight < 0:
+		return fmt.Errorf("poids invalide pour %q", key.ID)
+	default:
+		return nil
+	}
 }
 
 func readResponseBody(r io.Reader) ([]byte, error) {
@@ -168,11 +260,4 @@ func readResponseBody(r io.Reader) ([]byte, error) {
 		return nil, fmt.Errorf("réponse trop volumineuse (limite %d octets)", maxResponseBody)
 	}
 	return body, nil
-}
-
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "..."
 }

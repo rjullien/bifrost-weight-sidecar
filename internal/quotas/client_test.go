@@ -9,14 +9,22 @@ import (
 	"time"
 )
 
-// apiPayload mirrors the live OpenCode Go /v1/usage payload.
-const apiPayload = `{
+// apiPayload mirrors the live OpenCode Go /v1/usage payload while keeping
+// resets inside the active periods at test execution time.
+func apiPayload() string {
+	now := time.Now().UTC()
+	return fmt.Sprintf(`{
   "usage": {
-    "rolling": {"status": "ok", "percent": 0, "resetsAt": "2026-08-30T22:15:39.000Z"},
-    "weekly":  {"status": "ok", "percent": 87, "resetsAt": "2026-08-31T00:00:00.000Z"},
-    "monthly": {"status": "ok", "percent": 52, "resetsAt": "2026-09-22T01:23:30.000Z"}
+    "rolling": {"status": "ok", "percent": 0, "resetsAt": %q},
+    "weekly":  {"status": "ok", "percent": 87, "resetsAt": %q},
+    "monthly": {"status": "ok", "percent": 52, "resetsAt": %q}
   }
-}`
+}`,
+		now.Add(4*time.Hour).Format(time.RFC3339Nano),
+		now.Add(3*24*time.Hour).Format(time.RFC3339Nano),
+		now.Add(10*24*time.Hour).Format(time.RFC3339Nano),
+	)
+}
 
 func TestUsageDirectAPI(t *testing.T) {
 	apiURL = "http://unused.local" // rewritten by the test server below
@@ -27,7 +35,7 @@ func TestUsageDirectAPI(t *testing.T) {
 		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 			t.Errorf("missing Bearer header")
 		}
-		fmt.Fprint(w, apiPayload)
+		fmt.Fprint(w, apiPayload())
 	}))
 	defer srv.Close()
 	apiURL = srv.URL + "/zen/go/v1/usage"
