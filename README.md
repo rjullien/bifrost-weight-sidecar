@@ -45,7 +45,7 @@ incomplètes.
 
 | Variable | Défaut | Description |
 |----------|--------|-------------|
-| `BIFROST_URL` | `http://localhost:8080` | Base URL du gateway Bifrost (localhost quand sidecar dans le pod) |
+| `BIFROST_URL` | `http://127.0.0.1:8080` | Base URL du gateway Bifrost (localhost quand sidecar dans le pod) |
 | `INTERVAL` | `1h` | Durée entre deux cycles (`30m`, `45s`, …) |
 | `WEEKLY_THRESHOLD` | `80` | % weekly au-delà duquel une clé sort de rotation (`0` désactive la règle) |
 | `PINNED_KEYS` | *(vide)* | Clés à ne JAMAIS toucher, séparées par des virgules (nom ou id) |
@@ -54,7 +54,7 @@ incomplètes.
 
 ## Déploiement
 
-Sidecar du pod Bifrost (même réseau → `http://localhost:8080`) :
+Sidecar du pod Bifrost (même réseau → `http://127.0.0.1:8080`) :
 
 ```yaml
 containers:
@@ -62,7 +62,7 @@ containers:
     image: ghcr.io/rjullien/bifrost-weight-sidecar:main
     env:
       - name: BIFROST_URL
-        value: http://localhost:8080
+        value: http://127.0.0.1:8080
     resources:
       requests: { cpu: 5m, memory: 16Mi }
       limits:   { cpu: 100m, memory: 64Mi }

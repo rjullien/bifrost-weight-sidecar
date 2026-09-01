@@ -32,7 +32,7 @@ type config struct {
 
 func loadConfig() config {
 	return config{
-		BifrostURL:      envOr("BIFROST_URL", "http://localhost:8080"),
+		BifrostURL:      envOr("BIFROST_URL", "http://127.0.0.1:8080"),
 		Interval:        envDurationOr("INTERVAL", time.Hour),
 		WeeklyThreshold: envIntOr("WEEKLY_THRESHOLD", 80),
 		Pinned:          envSetOr("PINNED_KEYS", nil),
