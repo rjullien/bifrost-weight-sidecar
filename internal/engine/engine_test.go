@@ -233,3 +233,62 @@ func TestLabelFromEnv(t *testing.T) {
 		}
 	}
 }
+
+// Une clé à 100% (monthly cramé, plus rien à brûler) ne doit JAMAIS être
+// réarmée par le fallback : lui rendre un poids enverrait du trafic vers une
+// clé qui échoue. Seule une clé avec encore du monthly à cramer (urgence > 0)
+// peut être ressuscitée.
+func TestComputeFallbackNeverRearmsBurnedKey(t *testing.T) {
+	cfg := Config{}
+	agents := healthyAgents()
+	// Main: monthly cramé (100%, dry) — mort pour de bon.
+	agents[0] = agent("Main", 100, 4, 4, 50, 0)
+	// R: weekly dry + monthly cramé — mort.
+	agents[1] = agent("R", 100, 4, 4, 95, 2)
+	// A: weekly dry mais monthly à 40% (60% à brûler, urgence 60/20=3) → vivable.
+	agents[2] = agent("A", 40, 0, 20, 95, 2)
+	// N: weekly dry mais monthly à 90% (10% à brûler, urgence 10/1=10) → vivable.
+	agents[3] = agent("N", 90, 0, 1, 95, 2)
+
+	changes := Compute(cfg, Input{Keys: healthyKeys(), Agents: agents})
+	// État final : poids initial (1) + changements appliqués.
+	final := map[string]float64{}
+	for _, k := range healthyKeys() {
+		final[k.Name] = k.Weight
+	}
+	for _, c := range changes {
+		final[c.Key.Name] = c.To
+	}
+	// Les clés cramées restent à 0 — jamais réarmées.
+	if final["opencode-go-key-1"] != 0 || final["opencode-go-key-2"] != 0 {
+		t.Errorf("cramées réarmées ! Main=%v R=%v, want 0/0 (ne jamais ressusciter une clé à 100%%)", final["opencode-go-key-1"], final["opencode-go-key-2"])
+	}
+	// Deux clés vivables : N (urgence 10) à 1, A (urgence 3) à 0.5.
+	if final["opencode-go-key-4"] != 1 {
+		t.Errorf("N final = %v, want 1 (clé vivable la plus urgente)", final["opencode-go-key-4"])
+	}
+	if final["opencode-go-key-3"] != 0.5 {
+		t.Errorf("A final = %v, want 0.5 (seconde clé vivable)", final["opencode-go-key-3"])
+	}
+}
+
+// Toutes les clés cramées → aucune réarmée : le pool est réellement mort, le
+// fallback ne doit pas envoyer de trafic vers des clés qui échouent.
+func TestComputeFallbackWithAllKeysBurned(t *testing.T) {
+	cfg := Config{}
+	agents := healthyAgents()
+	for i := range agents {
+		agents[i] = agent(agents[i].Label, 100, 4, 4, 50, 0) // tout à 100%
+	}
+
+	changes := Compute(cfg, Input{Keys: healthyKeys(), Agents: agents})
+	to := map[string]float64{}
+	for _, c := range changes {
+		to[c.Key.Name] = c.To
+	}
+	for _, name := range []string{"opencode-go-key-1", "opencode-go-key-2", "opencode-go-key-3", "opencode-go-key-4"} {
+		if to[name] != 0 {
+			t.Errorf("%s = %v, want 0 (clé cramée — jamais réarmée même si tout est mort)", name, to[name])
+		}
+	}
+}

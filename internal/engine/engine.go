@@ -93,6 +93,11 @@ func Compute(cfg Config, in Input) []Change {
 	// non-zero weight. Mettre toutes les clés à 0 tue le provider entier :
 	// on garde toujours 2 clés vivantes, la première à 1 et la seconde à
 	// 0.5 (poids faible mais non nul), réarmées par urgence décroissante.
+	//
+	// Seules les clés avec encore du monthly à cramer (urgence > 0) peuvent
+	// être réarmées : une clé à 100% (monthly dry) ou morte côté Bifrost ne
+	// répondra pas — lui rendre un poids ne ferait qu'envoyer du trafic vers
+	// une clé en échec. Le fallback ne ressuscite que ce qui peut servir.
 	active := 0
 	for _, t := range targets {
 		if t.weight > 0 {
@@ -111,14 +116,22 @@ func Compute(cfg Config, in Input) []Change {
 				}
 			}
 		}
-		// Re-arm dead keys until MinActive are alive: first at 1, second
-		// at 0.5 — a live spare carrying little traffic, never 0. A key
-		// killed by Bifrost health (rule 1) is NOT re-armed: it is really
-		// dead, pushing traffic to it would fail requests.
+		// Re-arm keys with burnable monthly quota (urgency > 0) until
+		// MinActive are alive: first at 1, second at 0.5 — a live spare
+		// carrying little traffic, never 0. Keys killed by Bifrost health or
+		// with no monthly quota left are NOT re-armed: they would fail.
 		fallbackWeights := []float64{1, 0.5}
 		for i := 0; i < len(targets) && active < cfg.MinActive; i++ {
 			if targets[i].weight > 0 || targets[i].key.Status != "success" {
 				continue
+			}
+			agent := byLabel[quotasLabel(targets[i].key)]
+			if agent == nil {
+				continue
+			}
+			u, ok := urgency(agent)
+			if !ok || u <= 0 {
+				continue // no monthly quota left to burn: really dead
 			}
 			idx := active
 			if idx >= len(fallbackWeights) {
