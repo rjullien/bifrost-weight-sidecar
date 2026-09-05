@@ -39,14 +39,20 @@ d'une clé reflète l'urgence de consommation :
 | 1 | Bifrost signale la clé non saine (`status != success`) | `0` |
 | 2 | Rolling 5h ≥ `ROLLING_EVICT_PERCENT` (bloqueur immédiat) | `0` |
 | 3 | Weekly projeté à sec avant son reset lundi (bloqueur) | `0` |
-| 4 | Monthly épuisé / projeté à sec jusqu'au reset | `0` |
+| 4 | Monthly à **100 %** (plafond strict, plus rien à cramer) | `0` |
 | 5 | Sinon | **urgence** = monthly restant (%) ÷ jours restants |
 
+**Monthly** : évincé **uniquement à 100 %**, pas sur une projection. Le quota
+mensuel non consommé est perdu au reset (*use-it-or-lose-it*) : une clé « projetée
+à sec » mais encore sous 100 % garde du quota à cramer, donc elle **reste en
+rotation** (avec une urgence plus élevée) plutôt que de gaspiller. Seul le weekly,
+qui est un *bloqueur* et non une perte, est anticipé sur sa projection.
+
 **Rolling 5h** : c'est un bloqueur *court*. À `ROLLING_EVICT_PERCENT` (99 % par
-défaut) la clé est déjà en train d'échouer, on la sort de rotation. Contrairement
-au weekly/monthly il n'y a pas de projection : la fenêtre glissante de 5 h se
-vide seule, donc la clé **réintègre la rotation d'elle-même** à un cycle suivant
-dès que le rolling repasse sous le seuil. Une clé bloquée uniquement sur le
+défaut) la clé est déjà en train d'échouer, on la sort de rotation. Il n'y a pas
+de projection : la fenêtre glissante de 5 h se vide seule, donc la clé
+**réintègre la rotation d'elle-même** à un cycle suivant dès que le rolling
+repasse sous le seuil. Une clé bloquée uniquement sur le
 rolling n'est **jamais** réarmée par le filet de secours (elle échouerait).
 
 **Urgence** : plus le monthly restant expire vite, plus le poids est élevé (la

@@ -6,8 +6,10 @@
 //   - The MONTHLY quota is lost if not consumed before the subscription
 //     anniversary reset (use-it-or-lose-it). The weight of a key reflects how
 //     much monthly quota remains versus how few days are left: the more quota
-//     about to expire, the more traffic the key gets. When at the ceiling
-//     (100%), there is nothing left to burn: weight 0.
+//     about to expire, the more traffic the key gets. It is taken out ONLY at
+//     the strict ceiling (100% consumed): a key merely "projected dry" still
+//     has quota that would be lost at the reset, so it keeps serving to burn
+//     it. No projection-based eviction on the monthly — that would waste quota.
 //   - The WEEKLY quota is a blocker, not a loss: when it hits the ceiling the
 //     key stops serving until its Monday reset. The engine anticipates the
 //     wall (projection) and takes the key out before it blocks.
@@ -199,9 +201,15 @@ func quotasLabel(key bifrost.Key) string {
 //  1. Bifrost reports the key as not healthy  → 0 (dead key)
 //  2. rolling 5h at/above the evict threshold → 0 (blocked right now, ~5h)
 //  3. weekly projected dry (dryDays > 0)     → 0 (will block before Monday)
-//  4. monthly at the ceiling (dryDays > 0)   → 0 (nothing left to burn)
+//  4. monthly at the ceiling (100% consumed) → 0 (nothing left to burn)
 //  5. otherwise                              → urgency (monthly remaining /
 //     days left) — the more quota about to expire, the more traffic.
+//
+// The monthly window is graded at the STRICT ceiling (100%), not on a
+// projection: the monthly quota is lost if not consumed before the anniversary
+// reset (use-it-or-lose-it), so a key merely "projected dry" must keep serving
+// to burn what remains. Only the weekly, a blocker rather than a loss, is
+// anticipated on its projection.
 func targetWeight(cfg Config, key bifrost.Key, byLabel map[string]*quotas.Agent) float64 {
 	// Rule 1: Bifrost's own key health. Applies even when the quota data
 	// is missing for this key.
@@ -224,15 +232,16 @@ func targetWeight(cfg Config, key bifrost.Key, byLabel map[string]*quotas.Agent)
 	}
 
 	weeklyDry := agent.WeeklyDryDays()
-	monthlyDry := agent.MonthlyDryDays()
 
 	// Rule 3: weekly blocker projected.
 	if weeklyDry >= 0 && weeklyDry > 0 {
 		return 0
 	}
 
-	// Rule 4: monthly quota exhausted (or projected dry until the reset).
-	if monthlyDry >= 0 && monthlyDry > 0 {
+	// Rule 4: monthly quota exhausted — STRICT ceiling only. A key merely
+	// "projected dry" still has monthly quota that would be LOST at the reset:
+	// keep it serving (rule 5) to burn it. Only 100% means nothing left.
+	if monthly := agent.MonthlyPercent(); monthly >= 100 {
 		return 0
 	}
 

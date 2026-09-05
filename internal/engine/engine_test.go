@@ -88,11 +88,12 @@ func TestComputePushesKeyWithExpiringQuota(t *testing.T) {
 	}
 }
 
-// Monthly quota exhausted → weight 0 (nothing left to burn).
+// Monthly quota exhausted at the STRICT ceiling (100%) → weight 0 (nothing
+// left to burn).
 func TestComputeZerosKeyWhenMonthlyDry(t *testing.T) {
 	cfg := Config{}
 	agents := healthyAgents()
-	agents[1] = agent("R", 100, 5, 5, 50, 0) // R at the ceiling for 5 days
+	agents[1] = agent("R", 100, 5, 5, 50, 0) // R at 100% for 5 days
 
 	changes := Compute(cfg, Input{Keys: healthyKeys(), Agents: agents})
 	if len(changes) != 1 {
@@ -100,6 +101,36 @@ func TestComputeZerosKeyWhenMonthlyDry(t *testing.T) {
 	}
 	if changes[0].Key.Name != "opencode-go-key-2" || changes[0].To != 0 {
 		t.Errorf("change = %+v, want key-2 -> 0", changes[0])
+	}
+}
+
+// A key PROJECTED dry on the monthly but still below 100% must keep serving:
+// the remaining monthly quota is lost at the reset (use-it-or-lose-it), so
+// evicting it would waste quota. Only the strict 100% ceiling evicts.
+func TestComputeKeepsMonthlyProjectedDryButBelowCeiling(t *testing.T) {
+	cfg := Config{}
+	agents := healthyAgents()
+	// R at 70%, projected dry in a few days (DryDays=3) — but 30% quota left
+	// to burn before the reset. Must NOT be zeroed; instead it burns faster
+	// (higher urgency) than the healthy keys.
+	agents[1] = agent("R", 70, 3, 2, 50, 0) // 30% left / 2 days → urgency 15
+
+	changes := Compute(cfg, Input{Keys: healthyKeys(), Agents: agents})
+	var rTo float64
+	rSeen := false
+	for _, c := range changes {
+		if c.Key.Name == "opencode-go-key-2" {
+			rTo, rSeen = c.To, true
+		}
+	}
+	if !rSeen {
+		t.Fatal("R should change weight (higher urgency), got no change")
+	}
+	if rTo == 0 {
+		t.Error("R zeroed while below 100% — quota would be wasted; want > 0")
+	}
+	if rTo != 15 {
+		t.Errorf("R to = %v, want 15 (30%% left / 2 days), burning the monthly", rTo)
 	}
 }
 
