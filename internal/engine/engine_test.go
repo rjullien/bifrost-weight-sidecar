@@ -134,11 +134,12 @@ func TestComputeKeepsMonthlyProjectedDryButBelowCeiling(t *testing.T) {
 	}
 }
 
-// Weekly projected dry → anticipate the block: 0 even with monthly quota left.
+// Weekly at/above the evict threshold → 0 even with monthly quota left: the
+// key is blocked until Monday. Graded on raw consumption, not on a projection.
 func TestComputeZerosKeyWhenWeeklyBlocks(t *testing.T) {
 	cfg := Config{}
 	agents := healthyAgents()
-	agents[2] = agent("A", 40, 0, 20, 95, 1.5) // weekly hits ceiling in 1.5 days
+	agents[2] = agent("A", 40, 0, 20, 99, 0) // weekly at 99% → blocked
 
 	changes := Compute(cfg, Input{Keys: healthyKeys(), Agents: agents})
 	if len(changes) != 1 {
@@ -146,6 +147,40 @@ func TestComputeZerosKeyWhenWeeklyBlocks(t *testing.T) {
 	}
 	if changes[0].Key.Name != "opencode-go-key-3" || changes[0].To != 0 {
 		t.Errorf("change = %+v, want key-3 -> 0 (weekly blocker)", changes[0])
+	}
+}
+
+// Weekly projected dry but still below the threshold must NOT evict on the
+// projection: only raw consumption at/above the threshold blocks. A high burn
+// rate alone (dryDays > 0) no longer takes the key out.
+func TestComputeKeepsKeyWhenWeeklyProjectedDryButBelowThreshold(t *testing.T) {
+	cfg := Config{}
+	agents := healthyAgents()
+	// Monthly 80%/20j → urgency 1 = current weight, so any diff would come from
+	// the weekly rule alone. Weekly 80% (projected dry) must NOT evict.
+	agents[2] = agent("A", 80, 0, 20, 80, 1.5)
+
+	changes := Compute(cfg, Input{Keys: healthyKeys(), Agents: agents})
+	if len(changes) != 0 {
+		t.Errorf("changes = %+v, want 0 (weekly 80%% < 99%%, projection ignored)", changes)
+	}
+}
+
+// The weekly eviction threshold is configurable, symmetric to the rolling one.
+func TestComputeWeeklyThresholdConfigurable(t *testing.T) {
+	agents := healthyAgents()
+	// Monthly 80%/20j → urgency 1 = current weight: isolate the weekly rule.
+	agents[2] = agent("A", 80, 0, 20, 92, 0) // weekly 92%
+
+	// Default threshold (99): 92% stays in rotation.
+	if changes := Compute(Config{}, Input{Keys: healthyKeys(), Agents: agents}); len(changes) != 0 {
+		t.Errorf("default threshold: changes = %+v, want 0 (92%% < 99%%)", changes)
+	}
+
+	// Lower threshold (90): 92% is now evicted.
+	changes := Compute(Config{WeeklyEvictPercent: 90}, Input{Keys: healthyKeys(), Agents: agents})
+	if len(changes) != 1 || changes[0].Key.Name != "opencode-go-key-3" || changes[0].To != 0 {
+		t.Errorf("threshold 90: changes = %+v, want key-3 -> 0", changes)
 	}
 }
 
@@ -208,18 +243,20 @@ func TestComputePinsByIdToo(t *testing.T) {
 	}
 }
 
-// Even when every key is projected dry (weekly or monthly), MinActive keys
-// must keep a non-zero weight: the pool never loses its spare. Re-armed keys
-// get 1 then 0.5 (a live spare carrying little traffic, never 0).
+// Even when every key is blocked (weekly at the ceiling or monthly at 100%),
+// MinActive keys must keep a non-zero weight: the pool never loses its spare.
+// Re-armed keys get 1 then 0.5 (a live spare carrying little traffic, never 0).
+//
+// The re-armed spares must be keys that can actually serve: a weekly-blocked
+// or monthly-dry key is never resurrected. Here Main and A keep burnable
+// monthly quota with a healthy weekly, so they become the spares.
 func TestComputeKeepsAtLeastMinActiveKeysAsFallback(t *testing.T) {
 	cfg := Config{}
 	agents := healthyAgents()
-	// All 4 keys blocked (weekly dry for 3, monthly ceiling for 1) → the
-	// fallback must resurrect 2 of them: Main at 1, N at 0.5.
-	agents[0] = agent("Main", 95, 0, 1, 95, 2) // weekly dry
-	agents[1] = agent("R", 100, 4, 4, 95, 2)   // weekly dry + monthly ceiling
-	agents[2] = agent("A", 40, 0, 20, 95, 2)   // weekly dry
-	agents[3] = agent("N", 100, 4, 4, 95, 2)   // weekly dry + monthly ceiling
+	agents[0] = agent("Main", 95, 0, 1, 50, 0) // healthy weekly, monthly burnable
+	agents[1] = agent("R", 100, 4, 4, 99, 0)   // weekly ceiling + monthly ceiling
+	agents[2] = agent("A", 40, 0, 20, 50, 0)   // healthy weekly, monthly burnable
+	agents[3] = agent("N", 100, 4, 4, 99, 0)   // weekly ceiling + monthly ceiling
 
 	changes := Compute(cfg, Input{Keys: healthyKeys(), Agents: agents})
 	// État final : poids initial (1) + changements appliqués.
@@ -230,27 +267,44 @@ func TestComputeKeepsAtLeastMinActiveKeysAsFallback(t *testing.T) {
 	for _, c := range changes {
 		final[c.Key.Name] = c.To
 	}
-	// Two keys must be alive: one at 1, one at 0.5.
-	var weights []float64
+	// R and N are doubly blocked (weekly ceiling + monthly 100%): always 0.
+	if final["opencode-go-key-2"] != 0 || final["opencode-go-key-4"] != 0 {
+		t.Errorf("blocked keys alive! R=%v N=%v, want 0/0", final["opencode-go-key-2"], final["opencode-go-key-4"])
+	}
+	// Main and A can serve (healthy weekly, monthly burnable) → at least two
+	// keys keep a non-zero weight, so the pool never loses its spare.
+	alive := 0
 	for _, v := range final {
 		if v > 0 {
-			weights = append(weights, v)
+			alive++
 		}
 	}
-	if len(weights) < 2 {
-		t.Fatalf("final weights = %v, want >= 2 alive keys (1 and 0.5)", weights)
+	if alive < 2 {
+		t.Errorf("alive keys = %d (final=%v), want >= 2 (pool keeps a spare)", alive, final)
 	}
-	hasOne, hasHalf := false, false
-	for _, w := range weights {
-		if w == 1 {
-			hasOne = true
-		}
-		if w == 0.5 {
-			hasHalf = true
-		}
+}
+
+// When EVERY key is blocked (weekly at the ceiling), the fallback must NOT
+// resurrect any of them: re-arming a weekly-blocked key only routes traffic to
+// a key that fails until Monday. The pool is left degraded on purpose.
+func TestComputeFallbackNeverRearmsWeeklyBlockedKey(t *testing.T) {
+	cfg := Config{}
+	agents := healthyAgents()
+	// All four at the weekly ceiling but with monthly quota still burnable:
+	// urgency > 0, yet they must stay at 0 (weekly blocks them right now).
+	for i := range agents {
+		agents[i] = agent(agents[i].Label, 40, 0, 20, 99, 0)
 	}
-	if !hasOne || !hasHalf {
-		t.Errorf("final weights = %v, want one key at 1 and one at 0.5", weights)
+
+	changes := Compute(cfg, Input{Keys: healthyKeys(), Agents: agents})
+	to := map[string]float64{}
+	for _, c := range changes {
+		to[c.Key.Name] = c.To
+	}
+	for _, name := range []string{"opencode-go-key-1", "opencode-go-key-2", "opencode-go-key-3", "opencode-go-key-4"} {
+		if to[name] != 0 {
+			t.Errorf("%s = %v, want 0 (weekly-blocked, never re-armed)", name, to[name])
+		}
 	}
 }
 
@@ -360,14 +414,14 @@ func TestLabelFromEnv(t *testing.T) {
 func TestComputeFallbackNeverRearmsBurnedKey(t *testing.T) {
 	cfg := Config{}
 	agents := healthyAgents()
-	// Main: monthly cramé (100%, dry) — mort pour de bon.
+	// Main: monthly cramé (100%) — mort pour de bon.
 	agents[0] = agent("Main", 100, 4, 4, 50, 0)
-	// R: weekly dry + monthly cramé — mort.
-	agents[1] = agent("R", 100, 4, 4, 95, 2)
-	// A: weekly dry mais monthly à 40% (60% à brûler, urgence 60/20=3) → vivable.
-	agents[2] = agent("A", 40, 0, 20, 95, 2)
-	// N: weekly dry mais monthly à 90% (10% à brûler, urgence 10/1=10) → vivable.
-	agents[3] = agent("N", 90, 0, 1, 95, 2)
+	// R: weekly au plafond (99%) + monthly cramé — mort.
+	agents[1] = agent("R", 100, 4, 4, 99, 0)
+	// A: weekly sain, monthly à 40% (60% à brûler, urgence 60/20=3) → vivable.
+	agents[2] = agent("A", 40, 0, 20, 50, 0)
+	// N: weekly sain, monthly à 90% (10% à brûler, urgence 10/1=10) → vivable.
+	agents[3] = agent("N", 90, 0, 1, 50, 0)
 
 	changes := Compute(cfg, Input{Keys: healthyKeys(), Agents: agents})
 	// État final : poids initial (1) + changements appliqués.
@@ -378,16 +432,17 @@ func TestComputeFallbackNeverRearmsBurnedKey(t *testing.T) {
 	for _, c := range changes {
 		final[c.Key.Name] = c.To
 	}
-	// Les clés cramées restent à 0 — jamais réarmées.
+	// Les clés cramées (100% ou weekly au plafond) restent à 0 — jamais réarmées.
 	if final["opencode-go-key-1"] != 0 || final["opencode-go-key-2"] != 0 {
-		t.Errorf("cramées réarmées ! Main=%v R=%v, want 0/0 (ne jamais ressusciter une clé à 100%%)", final["opencode-go-key-1"], final["opencode-go-key-2"])
+		t.Errorf("cramées réarmées ! Main=%v R=%v, want 0/0 (ne jamais ressusciter une clé bloquée)", final["opencode-go-key-1"], final["opencode-go-key-2"])
 	}
-	// Deux clés vivables : N (urgence 10) à 1, A (urgence 3) à 0.5.
-	if final["opencode-go-key-4"] != 1 {
-		t.Errorf("N final = %v, want 1 (clé vivable la plus urgente)", final["opencode-go-key-4"])
+	// Les deux clés vivables servent (poids = leur urgence : A=3, N=10). Elles
+	// portent le trafic sans que le fallback ait à intervenir.
+	if final["opencode-go-key-3"] != 3 {
+		t.Errorf("A final = %v, want 3 (urgence 60%%/20j)", final["opencode-go-key-3"])
 	}
-	if final["opencode-go-key-3"] != 0.5 {
-		t.Errorf("A final = %v, want 0.5 (seconde clé vivable)", final["opencode-go-key-3"])
+	if final["opencode-go-key-4"] != 10 {
+		t.Errorf("N final = %v, want 10 (urgence 10%%/1j)", final["opencode-go-key-4"])
 	}
 }
 
