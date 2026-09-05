@@ -4,13 +4,13 @@ Contrôleur de poids pour le provider `opencode-go` du gateway **Bifrost**.
 Tourne en sidecar dans le pod Bifrost et rééquilibre dynamiquement les poids de
 chargement des clés en fonction des quotas OpenCode Go.
 
-**Phase 1 (actuelle)** : rééquilibrage piloté par les quotas, 1×/heure.
+**Phase 1 (actuelle)** : rééquilibrage piloté par les quotas, toutes les 10 min.
 **Phase 2 (prévue)** : détection de clé dead par scan des logs Bifrost
-(`/api/logs`), réaction immédiate sans attendre l'heure.
+(`/api/logs`), réaction immédiate sans attendre le cycle.
 
 ## Principe
 
-À chaque cycle (toutes les `INTERVAL`) :
+À chaque cycle (toutes les `INTERVAL`, 10 min par défaut) :
 
 1. `GET /api/providers/opencode-go/keys` → poids actuels + statut de chaque clé
 2. `GET https://opencode.ai/zen/go/v1/usage` par clé, avec au plus **4 requêtes simultanées** → quotas **directement**
@@ -37,9 +37,23 @@ d'une clé reflète l'urgence de consommation :
 | # | Règle | Poids |
 |---|-------|-------|
 | 1 | Bifrost signale la clé non saine (`status != success`) | `0` |
-| 2 | Weekly projeté à sec avant son reset lundi (bloqueur) | `0` |
-| 3 | Monthly épuisé / projeté à sec jusqu'au reset | `0` |
-| 4 | Sinon | **urgence** = monthly restant (%) ÷ jours restants |
+| 2 | Rolling 5h ≥ `ROLLING_EVICT_PERCENT` (bloqueur immédiat) | `0` |
+| 3 | Weekly projeté à sec avant son reset lundi (bloqueur) | `0` |
+| 4 | Monthly à **100 %** (plafond strict, plus rien à cramer) | `0` |
+| 5 | Sinon | **urgence** = monthly restant (%) ÷ jours restants |
+
+**Monthly** : évincé **uniquement à 100 %**, pas sur une projection. Le quota
+mensuel non consommé est perdu au reset (*use-it-or-lose-it*) : une clé « projetée
+à sec » mais encore sous 100 % garde du quota à cramer, donc elle **reste en
+rotation** (avec une urgence plus élevée) plutôt que de gaspiller. Seul le weekly,
+qui est un *bloqueur* et non une perte, est anticipé sur sa projection.
+
+**Rolling 5h** : c'est un bloqueur *court*. À `ROLLING_EVICT_PERCENT` (99 % par
+défaut) la clé est déjà en train d'échouer, on la sort de rotation. Il n'y a pas
+de projection : la fenêtre glissante de 5 h se vide seule, donc la clé
+**réintègre la rotation d'elle-même** à un cycle suivant dès que le rolling
+repasse sous le seuil. Une clé bloquée uniquement sur le
+rolling n'est **jamais** réarmée par le filet de secours (elle échouerait).
 
 **Urgence** : plus le monthly restant expire vite, plus le poids est élevé (la
 clé « crame » son quota avant qu'il soit perdu). Bifrost route en proportion
@@ -61,7 +75,8 @@ en erreur) est laissée **intacte** : jamais de décision sur données incomplè
 | Variable | Défaut | Description |
 |----------|--------|-------------|
 | `BIFROST_URL` | `http://127.0.0.1:8080` | URL HTTP(S) absolue du gateway Bifrost, sans query ni fragment (localhost IPv4 quand sidecar dans le pod) |
-| `INTERVAL` | `1h` | Durée strictement positive entre la fin d’un cycle et le suivant (`30m`, `45s`, …) |
+| `INTERVAL` | `10m` | Durée strictement positive entre la fin d’un cycle et le suivant (`10m`, `30m`, `45s`, …) |
+| `ROLLING_EVICT_PERCENT` | `99` | Seuil (%) du rolling 5h au-delà duquel la clé sort de rotation. Entier dans `[1,100]` |
 | `PINNED_KEYS` | *(vide)* | Clés à ne JAMAIS toucher, séparées par des virgules (nom ou id) |
 | `DRY_RUN` | `false` | Log les changements sans les appliquer |
 | `OPENCODE_GO_API_KEY*` | *(requis)* | Clés OpenCode Go à surveiller : `OPENCODE_GO_API_KEY` = Main, `OPENCODE_GO_API_KEY_A` = A, etc. |
