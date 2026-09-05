@@ -25,12 +25,17 @@ import (
 )
 
 type config struct {
-	BifrostURL   string
-	Interval     time.Duration
-	RetryBackoff time.Duration
-	Pinned       map[string]bool
-	DryRun       bool
+	BifrostURL          string
+	Interval            time.Duration
+	RetryBackoff        time.Duration
+	Pinned              map[string]bool
+	DryRun              bool
+	RollingEvictPercent int
 }
+
+// defaultRollingEvictPercent matches the engine default: at 99% the rolling 5h
+// window is treated as critical and the key is taken out of rotation.
+const defaultRollingEvictPercent = 99
 
 const (
 	// retryBackoffStart : délai initial après un échec de connexion à Bifrost.
@@ -45,7 +50,7 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	interval, err := envDuration("INTERVAL", time.Hour)
+	interval, err := envDuration("INTERVAL", 10*time.Minute)
 	if err != nil {
 		return config{}, err
 	}
@@ -55,12 +60,17 @@ func loadConfig() (config, error) {
 	} else {
 		return config{}, err
 	}
+	rollingEvict, err := envPercent("ROLLING_EVICT_PERCENT", defaultRollingEvictPercent)
+	if err != nil {
+		return config{}, err
+	}
 	return config{
-		BifrostURL:   bifrostURL,
-		Interval:     interval,
-		RetryBackoff: retryBackoff,
-		Pinned:       envSetOr("PINNED_KEYS", nil),
-		DryRun:       envBoolOr("DRY_RUN", false),
+		BifrostURL:          bifrostURL,
+		Interval:            interval,
+		RetryBackoff:        retryBackoff,
+		Pinned:              envSetOr("PINNED_KEYS", nil),
+		DryRun:              envBoolOr("DRY_RUN", false),
+		RollingEvictPercent: rollingEvict,
 	}, nil
 }
 
@@ -69,12 +79,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("configuration invalide: %v", err)
 	}
-	log.Printf("sidecar: bifrost=%s interval=%s pinned=%v dry_run=%v policy=cramer-monthly (weekly=bloqueur, secours >= 2)",
-		urlForLog(cfg.BifrostURL), cfg.Interval, cfg.Pinned, cfg.DryRun)
+	log.Printf("sidecar: bifrost=%s interval=%s pinned=%v dry_run=%v rolling_evict=%d%% policy=cramer-monthly (weekly+rolling=bloqueurs, secours >= 2)",
+		urlForLog(cfg.BifrostURL), cfg.Interval, cfg.Pinned, cfg.DryRun, cfg.RollingEvictPercent)
 
 	bf := bifrost.NewClient(cfg.BifrostURL, 5*time.Second)
 	qu := quotas.NewClient(5 * time.Second)
-	pol := engine.Config{Pinned: cfg.Pinned, MinActive: 2}
+	pol := engine.Config{Pinned: cfg.Pinned, MinActive: 2, RollingEvictPercent: cfg.RollingEvictPercent}
 
 	run := func() bool {
 		keys, err := bf.Keys()
@@ -234,6 +244,24 @@ func envBoolOr(key string, def bool) bool {
 		}
 	}
 	return def
+}
+
+// envPercent reads an integer percentage in [1,100]. Empty falls back to def.
+// A rolling evict threshold outside that range is a configuration error: 0
+// would evict every key on sight, and >100 can never fire.
+func envPercent(key string, def int) (int, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s=%q: entier attendu: %w", key, v, err)
+	}
+	if n < 1 || n > 100 {
+		return 0, fmt.Errorf("%s=%q: pourcentage attendu dans [1,100]", key, v)
+	}
+	return n, nil
 }
 
 func envDuration(key string, def time.Duration) (time.Duration, error) {

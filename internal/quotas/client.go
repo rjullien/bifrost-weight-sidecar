@@ -302,6 +302,20 @@ func (a *Agent) MonthlyPercent() int {
 	return -1
 }
 
+// RollingPercent returns the raw rolling 5h consumption (0-100), or -1 when the
+// agent carries no rolling window (or is in error). The rolling window is a
+// hard blocker with no pace maths: at the ceiling the key stops serving right
+// now, and the API returns resetsAt = now+5h when usage is zero, so no period
+// start is derivable (hence no Budget). The engine grades it on raw percent.
+func (a *Agent) RollingPercent() int {
+	for _, w := range a.Windows {
+		if w.Name == "Rolling 5h" {
+			return w.Percent
+		}
+	}
+	return -1
+}
+
 // MonthlyDaysLeft returns the number of days remaining until the monthly
 // reset (anniversary), or -1 when unknown.
 func (a *Agent) MonthlyDaysLeft() float64 {

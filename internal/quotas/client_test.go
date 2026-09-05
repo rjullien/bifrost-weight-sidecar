@@ -140,3 +140,20 @@ func TestNewAccessors(t *testing.T) {
 		t.Errorf("WeeklyDryDays = %v, want 1.5", got)
 	}
 }
+
+func TestRollingPercent(t *testing.T) {
+	// Agent with a rolling window at 99%.
+	withRolling := &Agent{Label: "X", Windows: []Window{
+		{Name: "Monthly", Percent: 50},
+		{Name: "Rolling 5h", Percent: 99},
+	}}
+	if got := withRolling.RollingPercent(); got != 99 {
+		t.Errorf("RollingPercent = %d, want 99", got)
+	}
+
+	// Agent with no rolling window → -1 (unknown, must not evict).
+	noRolling := &Agent{Label: "Y", Windows: []Window{{Name: "Monthly", Percent: 50}}}
+	if got := noRolling.RollingPercent(); got != -1 {
+		t.Errorf("RollingPercent = %d, want -1 (no rolling window)", got)
+	}
+}

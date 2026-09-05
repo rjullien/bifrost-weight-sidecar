@@ -12,8 +12,14 @@ func key(id, name, ref string, weight float64, status string) bifrost.Key {
 }
 
 // agent builds a quota agent: monthly percent + monthly dry days + monthly
-// days left + weekly percent + weekly dry days.
+// days left + weekly percent + weekly dry days. Rolling 5h defaults to 0.
 func agent(label string, monthlyPct int, monthlyDry, monthlyDaysLeft float64, weeklyPct int, weeklyDry float64) quotas.Agent {
+	return agentRolling(label, monthlyPct, monthlyDry, monthlyDaysLeft, weeklyPct, weeklyDry, 0)
+}
+
+// agentRolling is agent() plus an explicit rolling 5h percent, for the rolling
+// eviction tests.
+func agentRolling(label string, monthlyPct int, monthlyDry, monthlyDaysLeft float64, weeklyPct int, weeklyDry float64, rollingPct int) quotas.Agent {
 	return quotas.Agent{
 		Label: label,
 		Windows: []quotas.Window{
@@ -21,7 +27,7 @@ func agent(label string, monthlyPct int, monthlyDry, monthlyDaysLeft float64, we
 				Budget: &quotas.Budget{Valid: true, DryDays: monthlyDry, DaysLeft: monthlyDaysLeft}},
 			{Name: "Weekly", Percent: weeklyPct,
 				Budget: &quotas.Budget{Valid: true, DryDays: weeklyDry}},
-			{Name: "Rolling 5h", Percent: 0},
+			{Name: "Rolling 5h", Percent: rollingPct},
 		},
 	}
 }
@@ -214,6 +220,88 @@ func TestComputeKeepsAtLeastMinActiveKeysAsFallback(t *testing.T) {
 	}
 	if !hasOne || !hasHalf {
 		t.Errorf("final weights = %v, want one key at 1 and one at 0.5", weights)
+	}
+}
+
+// Rolling 5h at/above the evict threshold → weight 0: the key is blocked right
+// now and would only serve failures until the ~5h window recovers.
+func TestComputeZerosKeyWhenRollingAtCeiling(t *testing.T) {
+	cfg := Config{}
+	agents := healthyAgents()
+	agents[2] = agentRolling("A", 80, 0, 20, 50, 0, 99) // rolling at the ceiling
+
+	changes := Compute(cfg, Input{Keys: healthyKeys(), Agents: agents})
+	if len(changes) != 1 {
+		t.Fatalf("changes = %d, want 1", len(changes))
+	}
+	if changes[0].Key.Name != "opencode-go-key-3" || changes[0].To != 0 {
+		t.Errorf("change = %+v, want key-3 -> 0 (rolling blocker)", changes[0])
+	}
+}
+
+// Rolling just below the threshold must NOT evict: the key still serves.
+func TestComputeKeepsKeyWhenRollingBelowThreshold(t *testing.T) {
+	cfg := Config{} // default threshold 99
+	agents := healthyAgents()
+	agents[2] = agentRolling("A", 80, 0, 20, 50, 0, 98) // 98% < 99%
+
+	changes := Compute(cfg, Input{Keys: healthyKeys(), Agents: agents})
+	if len(changes) != 0 {
+		t.Errorf("changes = %+v, want 0 (rolling 98%% below 99%% threshold)", changes)
+	}
+}
+
+// The eviction threshold is configurable: at RollingEvictPercent=90 a key at
+// 92% is evicted, whereas the default (99) would keep it.
+func TestComputeRollingThresholdConfigurable(t *testing.T) {
+	agents := healthyAgents()
+	agents[2] = agentRolling("A", 80, 0, 20, 50, 0, 92)
+
+	// Default threshold (99): 92% stays in rotation.
+	if changes := Compute(Config{}, Input{Keys: healthyKeys(), Agents: agents}); len(changes) != 0 {
+		t.Errorf("default threshold: changes = %+v, want 0 (92%% < 99%%)", changes)
+	}
+
+	// Lower threshold (90): 92% is now evicted.
+	changes := Compute(Config{RollingEvictPercent: 90}, Input{Keys: healthyKeys(), Agents: agents})
+	if len(changes) != 1 || changes[0].Key.Name != "opencode-go-key-3" || changes[0].To != 0 {
+		t.Errorf("threshold 90: changes = %+v, want key-3 -> 0", changes)
+	}
+}
+
+// A key blocked ONLY by the rolling window (no weekly/monthly dry, monthly
+// quota still burnable) must never be re-armed by the fallback: it would serve
+// failures for the next ~5h. This isolates the rolling skip as the sole reason
+// the key is not resurrected — a weekly/monthly-dry key would be skipped for
+// other reasons too.
+func TestComputeFallbackNeverRearmsRollingBlockedKey(t *testing.T) {
+	cfg := Config{}
+	agents := healthyAgents()
+	// Main + R: rolling at ceiling, but monthly has room and weekly is fine.
+	// Their only blocker is the rolling window. Without the rolling skip, the
+	// fallback would happily re-arm them (urgency > 0).
+	agents[0] = agentRolling("Main", 40, 0, 20, 50, 0, 99) // urgency 60/20 = 3
+	agents[1] = agentRolling("R", 40, 0, 20, 50, 0, 99)    // urgency 60/20 = 3
+	// A + N: monthly ceiling (dry) — dead for good, cannot be the spares.
+	agents[2] = agent("A", 100, 4, 4, 50, 0)
+	agents[3] = agent("N", 100, 4, 4, 50, 0)
+
+	changes := Compute(cfg, Input{Keys: healthyKeys(), Agents: agents})
+	final := map[string]float64{}
+	for _, k := range healthyKeys() {
+		final[k.Name] = k.Weight
+	}
+	for _, c := range changes {
+		final[c.Key.Name] = c.To
+	}
+	// Every key must end at 0: the only keys with burnable monthly (Main, R)
+	// are rolling-blocked and must NOT be re-armed; A and N are monthly-dry.
+	// The pool is legitimately left with no spare rather than routing to keys
+	// that would fail right now.
+	for _, name := range []string{"opencode-go-key-1", "opencode-go-key-2", "opencode-go-key-3", "opencode-go-key-4"} {
+		if final[name] != 0 {
+			t.Errorf("%s = %v, want 0 (rolling-blocked or monthly-dry, never re-armed)", name, final[name])
+		}
 	}
 }
 
