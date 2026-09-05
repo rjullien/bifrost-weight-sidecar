@@ -11,8 +11,9 @@
 //     has quota that would be lost at the reset, so it keeps serving to burn
 //     it. No projection-based eviction on the monthly — that would waste quota.
 //   - The WEEKLY quota is a blocker, not a loss: when it hits the ceiling the
-//     key stops serving until its Monday reset. The engine anticipates the
-//     wall (projection) and takes the key out before it blocks.
+//     key stops serving until its Monday reset. It is graded on raw
+//     consumption at a near-ceiling threshold (WeeklyEvictPercent, 99% by
+//     default) and taken out — no projection, like the rolling window.
 //   - The ROLLING 5h quota is a short-lived blocker: at the ceiling the key
 //     stops serving for up to 5 hours, then recovers on its own. It has no
 //     pace maths (the API returns now+5h at zero usage), so it is graded on
@@ -43,6 +44,11 @@ type Config struct {
 	// receiving traffic. Defaults to defaultRollingEvictPercent when <= 0.
 	// A value >= 100 evicts only at the strict ceiling.
 	RollingEvictPercent int
+	// WeeklyEvictPercent is the weekly consumption (0-100) at or above which a
+	// key is taken out of rotation. Like the rolling window, the weekly is a
+	// blocker graded on raw consumption, not on a projection. Defaults to
+	// defaultWeeklyEvictPercent when <= 0.
+	WeeklyEvictPercent int
 }
 
 // defaultRollingEvictPercent is the rolling 5h consumption at or above which a
@@ -50,6 +56,13 @@ type Config struct {
 // own within ~5h, so the key is evicted only right at the ceiling, and a later
 // cycle (every 10 min by default) re-enters it as soon as it drops back.
 const defaultRollingEvictPercent = 99
+
+// defaultWeeklyEvictPercent is the weekly consumption at or above which a key
+// is taken out of rotation. Set to 99%, matching the rolling window: the
+// weekly is a blocker (the key stops serving until its Monday reset), so it is
+// evicted right at the ceiling on raw consumption rather than anticipated on a
+// projection.
+const defaultWeeklyEvictPercent = 99
 
 // Change is one weight to apply.
 type Change struct {
@@ -71,6 +84,15 @@ func rollingPercent(agent *quotas.Agent) int {
 		return -1
 	}
 	return agent.RollingPercent()
+}
+
+// weeklyPercent returns the agent's weekly consumption, or -1 when the agent
+// is nil or carries no weekly signal (unknown).
+func weeklyPercent(agent *quotas.Agent) int {
+	if agent == nil {
+		return -1
+	}
+	return agent.WeeklyPercent()
 }
 
 // urgency is the monthly burn rate: how much monthly quota (percent) remains
@@ -100,6 +122,9 @@ func Compute(cfg Config, in Input) []Change {
 	}
 	if cfg.RollingEvictPercent <= 0 {
 		cfg.RollingEvictPercent = defaultRollingEvictPercent
+	}
+	if cfg.WeeklyEvictPercent <= 0 {
+		cfg.WeeklyEvictPercent = defaultWeeklyEvictPercent
 	}
 	byLabel := make(map[string]*quotas.Agent, len(in.Agents))
 	for i := range in.Agents {
@@ -161,9 +186,13 @@ func Compute(cfg Config, in Input) []Change {
 				continue
 			}
 			agent := byLabel[quotasLabel(targets[i].key)]
-			// A key blocked on the rolling 5h window fails right now: never
-			// re-arm it, exactly like a monthly-dry or Bifrost-unhealthy key.
+			// A key blocked on the rolling 5h or weekly window fails right
+			// now: never re-arm it, exactly like a monthly-dry or
+			// Bifrost-unhealthy key.
 			if r := rollingPercent(agent); r >= 0 && r >= cfg.RollingEvictPercent {
+				continue
+			}
+			if wk := weeklyPercent(agent); wk >= 0 && wk >= cfg.WeeklyEvictPercent {
 				continue
 			}
 			u, ok := urgency(agent)
@@ -198,18 +227,19 @@ func quotasLabel(key bifrost.Key) string {
 // not assessable (quota data missing for this key).
 //
 // Rules, in priority order:
-//  1. Bifrost reports the key as not healthy  → 0 (dead key)
-//  2. rolling 5h at/above the evict threshold → 0 (blocked right now, ~5h)
-//  3. weekly projected dry (dryDays > 0)     → 0 (will block before Monday)
-//  4. monthly at the ceiling (100% consumed) → 0 (nothing left to burn)
-//  5. otherwise                              → urgency (monthly remaining /
+//  1. Bifrost reports the key as not healthy   → 0 (dead key)
+//  2. rolling 5h at/above RollingEvictPercent  → 0 (blocked right now, ~5h)
+//  3. weekly at/above WeeklyEvictPercent       → 0 (blocked until Monday)
+//  4. monthly at the ceiling (100% consumed)   → 0 (nothing left to burn)
+//  5. otherwise                                → urgency (monthly remaining /
 //     days left) — the more quota about to expire, the more traffic.
 //
-// The monthly window is graded at the STRICT ceiling (100%), not on a
-// projection: the monthly quota is lost if not consumed before the anniversary
-// reset (use-it-or-lose-it), so a key merely "projected dry" must keep serving
-// to burn what remains. Only the weekly, a blocker rather than a loss, is
-// anticipated on its projection.
+// The rolling and weekly windows are BLOCKERS, graded on raw consumption at a
+// near-ceiling threshold (99% by default): once there, the key stops serving,
+// so pushing more traffic only produces failures. The monthly window is graded
+// at the STRICT ceiling (100%): its quota is lost if not consumed before the
+// anniversary reset (use-it-or-lose-it), so a key below 100% must keep serving
+// to burn what remains rather than be evicted early and waste it.
 func targetWeight(cfg Config, key bifrost.Key, byLabel map[string]*quotas.Agent) float64 {
 	// Rule 1: Bifrost's own key health. Applies even when the quota data
 	// is missing for this key.
@@ -231,10 +261,11 @@ func targetWeight(cfg Config, key bifrost.Key, byLabel map[string]*quotas.Agent)
 		return 0
 	}
 
-	weeklyDry := agent.WeeklyDryDays()
-
-	// Rule 3: weekly blocker projected.
-	if weeklyDry >= 0 && weeklyDry > 0 {
+	// Rule 3: weekly blocker. Graded on raw consumption, like the rolling
+	// window: at/above the threshold the key stops serving until its Monday
+	// reset, so it is taken out. It re-enters via the urgency path on a later
+	// cycle once the weekly resets and drops back below the threshold.
+	if weekly := agent.WeeklyPercent(); weekly >= 0 && weekly >= cfg.WeeklyEvictPercent {
 		return 0
 	}
 
