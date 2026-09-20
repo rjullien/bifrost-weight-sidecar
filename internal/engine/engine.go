@@ -1,29 +1,20 @@
 // Package engine turns Bifrost key state and OpenCode Go quota positions into
 // weight changes.
 //
-// Weight policy — "cramer le monthly, garde-fou weekly + rolling, secours ≥ 2":
+// Weight policy — "burn monthly to 100% before reset, blockers, fail-open spare":
 //
 //   - The MONTHLY quota is lost if not consumed before the subscription
-//     anniversary reset (use-it-or-lose-it). The weight of a key reflects how
-//     much monthly quota remains versus how few days are left: the more quota
-//     about to expire, the more traffic the key gets. It is taken out ONLY at
-//     the strict ceiling (100% consumed): a key merely "projected dry" still
-//     has quota that would be lost at the reset, so it keeps serving to burn
-//     it. No projection-based eviction on the monthly — that would waste quota.
-//   - The WEEKLY quota is a blocker, not a loss: when it hits the ceiling the
-//     key stops serving until its Monday reset. It is graded on raw
-//     consumption at a near-ceiling threshold (WeeklyEvictPercent, 99% by
-//     default) and taken out — no projection, like the rolling window.
-//   - The ROLLING 5h quota is a short-lived blocker: at the ceiling the key
-//     stops serving for up to 5 hours, then recovers on its own. It has no
-//     pace maths (the API returns now+5h at zero usage), so it is graded on
-//     raw consumption: at or above RollingEvictPercent the key is taken out,
-//     and re-enters rotation by itself on a later cycle once it drops back.
-//   - MinActive counts distinct enabled healthy subscriptions, including pinned
-//     and untouched healthy keys; duplicate Bifrost entries sharing one env
-//     ref count once. The fallback may re-arm a key that still has burnable
-//     monthly quota, but never one already at a weekly/rolling/monthly blocker
-//     or unhealthy in Bifrost.
+//     anniversary reset (use-it-or-lose-it). The goal is to burn every
+//     assessable key to 100% before that reset.
+//   - Keys projected to hit 100% in time (MonthlyDryDays > 0) do not need
+//     burn-priority traffic. Keys that still have remaining monthly AND will
+//     NOT hit 100% at current pace (MonthlyDryDays == 0) are under-burners:
+//     when any exist, they receive all weight (winner-take-all / split by
+//     urgency), normalized so active targets sum to 100.
+//   - The WEEKLY and ROLLING 5h quotas are hard blockers graded on raw
+//     consumption at near-ceiling thresholds (99% by default).
+//   - MinActive fail-open only when the pool would otherwise have zero
+//     routable keys: it must not dilute a single under-burner that needs 100%.
 package engine
 
 import (
@@ -42,8 +33,10 @@ type Config struct {
 	// Pinned lists key names (or ids) the controller must never touch:
 	// manual decisions win over automation for those keys.
 	Pinned map[string]bool
-	// MinActive is the minimum number of distinct healthy subscriptions that
-	// should keep a non-zero weight. Defaults to 2 when below 1.
+	// MinActive is the minimum number of distinct healthy subscriptions to
+	// re-arm when the managed pool would otherwise have zero routable keys.
+	// Defaults to 2 when below 1. It does not force a second key when an
+	// under-burner already holds the burn-to-100% allocation.
 	MinActive int
 	// RollingEvictPercent is the rolling 5h consumption (0-100) at or above
 	// which a key is taken out of rotation. The rolling window is a hard
@@ -100,7 +93,7 @@ func normalizeWeight(weight float64) (float64, bool) {
 	return math.Round(weight*weightScale) / weightScale, true
 }
 
-// urgency is the monthly burn rate: how much monthly quota remains per day.
+// urgency is the monthly burn rate: remaining monthly percent per day left.
 func urgency(agent *quotas.Agent) (float64, bool) {
 	if agent == nil || agent.Error != "" {
 		return 0, false
@@ -110,12 +103,70 @@ func urgency(agent *quotas.Agent) (float64, bool) {
 	if pct < 0 || pct > 100 || days <= 0 || math.IsNaN(days) || math.IsInf(days, 0) {
 		return 0, false
 	}
-	return normalizeWeight(float64(100-pct) / days)
+	raw := float64(100-pct) / days
+	if math.IsNaN(raw) || math.IsInf(raw, 0) || raw < 0 {
+		return 0, false
+	}
+	return normalizeWeight(raw)
+}
+
+// underBurner is a key with remaining monthly quota that will NOT reach 100%
+// before the anniversary reset at the current pace (MonthlyDryDays == 0).
+// MonthlyDryDays > 0 means on track to hit the ceiling; -1 means unknown.
+func underBurner(agent *quotas.Agent) bool {
+	if agent == nil || agent.Error != "" {
+		return false
+	}
+	pct := agent.MonthlyPercent()
+	if pct < 0 || pct >= 100 {
+		return false
+	}
+	dry := agent.MonthlyDryDays()
+	return dry == 0
+}
+
+// normalizeScoresToHundred turns raw positive scores into percentage weights
+// that sum to exactly 100 (weightScale rounding; largest absorbs the delta).
+func normalizeScoresToHundred(scores []float64) []float64 {
+	out := make([]float64, len(scores))
+	var sum float64
+	for _, s := range scores {
+		if s > 0 {
+			sum += s
+		}
+	}
+	if sum <= 0 {
+		return out
+	}
+
+	var roundedSum float64
+	largest := -1
+	for i, s := range scores {
+		if s <= 0 {
+			continue
+		}
+		w, ok := normalizeWeight(100 * s / sum)
+		if !ok || w <= 0 {
+			continue
+		}
+		out[i] = w
+		roundedSum += w
+		if largest < 0 || out[i] > out[largest] {
+			largest = i
+		}
+	}
+	if largest >= 0 {
+		delta := 100 - roundedSum
+		if adj, ok := normalizeWeight(out[largest] + delta); ok && adj > 0 {
+			out[largest] = adj
+		}
+	}
+	return out
 }
 
 // Compute decides the target weight of every managed key. Healthy keys whose
 // quotas cannot be assessed and pinned keys are left untouched, but still
-// count toward the fallback pool when already active.
+// count toward the fail-open pool when already active.
 func Compute(cfg Config, in Input) []Change {
 	if cfg.MinActive < 1 {
 		cfg.MinActive = 2
@@ -144,6 +195,7 @@ func Compute(cfg Config, in Input) []Change {
 		key        bifrost.Key
 		label      string
 		agent      *quotas.Agent
+		blocked    bool
 		weight     float64
 	}
 
@@ -160,18 +212,65 @@ func Compute(cfg Config, in Input) []Change {
 		if label == "" || cfg.Pinned[key.Name] || cfg.Pinned[key.ID] {
 			continue
 		}
-		weight := targetWeight(cfg, key, byLabel)
-		if weight < 0 {
+		status := assessKey(cfg, key, byLabel)
+		if status == assessSkip {
 			continue
 		}
-		effective[i] = weight
-		targets = append(targets, target{
+		agent := byLabel[label]
+		t := target{
 			inputIndex: i,
 			key:        key,
 			label:      label,
-			agent:      byLabel[label],
-			weight:     weight,
-		})
+			agent:      agent,
+			blocked:    status == assessBlocked,
+		}
+		targets = append(targets, t)
+	}
+
+	// Raw burn scores among assessable non-blocked keys.
+	scores := make([]float64, len(targets))
+	var underIdx []int
+	for i, t := range targets {
+		if t.blocked {
+			continue
+		}
+		u, ok := urgency(t.agent)
+		if !ok {
+			// No usable monthly signal: leave untouched (do not overwrite).
+			targets[i].weight = -1
+			continue
+		}
+		scores[i] = u // provisional; may be cleared if under-burners exist
+		if underBurner(t.agent) {
+			underIdx = append(underIdx, i)
+		}
+	}
+
+	if len(underIdx) > 0 {
+		// Under-burners take all weight; on-track keys get 0.
+		for i := range scores {
+			scores[i] = 0
+		}
+		for _, i := range underIdx {
+			u, ok := urgency(targets[i].agent)
+			if ok {
+				scores[i] = u
+			}
+		}
+	}
+	// else: zero under-burners → keep urgency scores among keys with remaining
+
+	weights := normalizeScoresToHundred(scores)
+	for i := range targets {
+		if targets[i].weight < 0 {
+			continue // unassessable monthly signal: leave effective untouched
+		}
+		if targets[i].blocked {
+			targets[i].weight = 0
+		} else {
+			targets[i].weight = weights[i]
+		}
+		effective[targets[i].inputIndex] = targets[i].weight
 	}
 
 	// Count distinct enabled healthy subscriptions in the effective final state.
@@ -184,18 +283,24 @@ func Compute(cfg Config, in Input) []Change {
 		active[subscriptionIdentity(key)] = true
 	}
 
-	if len(active) < cfg.MinActive {
+	// Fail-open spare ONLY when the pool has zero routable keys. Do not dilute
+	// a single under-burner that already holds 100%.
+	if len(active) == 0 {
 		sort.SliceStable(targets, func(i, j int) bool {
 			ui, _ := urgency(targets[i].agent)
 			uj, _ := urgency(targets[j].agent)
 			return ui > uj
 		})
 
+		rearmed := make([]int, 0, cfg.MinActive)
 		for i := range targets {
 			if len(active) >= cfg.MinActive {
 				break
 			}
 			t := &targets[i]
+			if t.weight < 0 {
+				continue
+			}
 			identity := subscriptionIdentity(t.key)
 			if t.weight > 0 || active[identity] || !fallbackEligible(cfg, t.key, t.agent) {
 				continue
@@ -207,11 +312,33 @@ func Compute(cfg Config, in Input) []Change {
 			}
 			effective[t.inputIndex] = t.weight
 			active[identity] = true
+			rearmed = append(rearmed, i)
+		}
+
+		// Re-normalize re-armed (and any positive) managed weights to 100.
+		if len(rearmed) > 0 {
+			raw := make([]float64, len(targets))
+			for i, t := range targets {
+				if t.weight > 0 {
+					raw[i] = t.weight
+				}
+			}
+			normed := normalizeScoresToHundred(raw)
+			for i := range targets {
+				if targets[i].weight < 0 || targets[i].blocked {
+					continue
+				}
+				targets[i].weight = normed[i]
+				effective[targets[i].inputIndex] = targets[i].weight
+			}
 		}
 	}
 
 	var changes []Change
 	for _, t := range targets {
+		if t.weight < 0 {
+			continue
+		}
 		if !WeightsEqual(t.weight, t.key.Weight) {
 			changes = append(changes, Change{Key: t.key, From: t.key.Weight, To: t.weight})
 		}
@@ -246,56 +373,53 @@ func fallbackEligible(cfg Config, key bifrost.Key, agent *quotas.Agent) bool {
 	if weekly := agent.WeeklyPercent(); weekly >= 0 && weekly >= cfg.WeeklyEvictPercent {
 		return false
 	}
-	// A readable monthly burn signal is enough, even when the rounded urgency
-	// weight is 0: the fallback can still bump the key to 1 / 0.5.
+	// A readable monthly burn signal is enough, even when urgency is tiny:
+	// the fail-open path can still bump the key then re-normalize to 100.
 	_, ok := urgency(agent)
 	return ok
 }
 
-// targetWeight returns a non-negative target, or -1 when the state is not
-// assessable. It is called only for managed env references.
+type assessStatus int
+
+const (
+	assessOK assessStatus = iota
+	assessBlocked
+	assessSkip // unassessable / disabled: leave untouched
+)
+
+// assessKey applies hard blockers and assessability gates. Allocation among
+// non-blocked keys is done in Compute (under-burner vs on-track + normalize).
 //
 // Rules, in priority order:
-//  1. Bifrost reports the key as not healthy   → 0 (dead key)
-//  2. rolling 5h at/above RollingEvictPercent  → 0 (blocked right now, ~5h)
-//  3. weekly at/above WeeklyEvictPercent       → 0 (blocked until Monday)
-//  4. monthly at the ceiling (100% consumed)   → 0 (nothing left to burn)
-//  5. otherwise                                → urgency (monthly remaining /
-//     days left) — the more quota about to expire, the more traffic.
-func targetWeight(cfg Config, key bifrost.Key, byLabel map[string]*quotas.Agent) float64 {
+//  1. explicitly disabled                         → leave untouched
+//  2. Bifrost reports the key as not healthy      → 0 (dead key)
+//  3. rolling 5h at/above RollingEvictPercent     → 0 (blocked right now, ~5h)
+//  4. weekly at/above WeeklyEvictPercent          → 0 (blocked until Monday)
+//  5. monthly at the ceiling (100% consumed)      → 0 (nothing left to burn)
+//  6. otherwise                                   → OK (score later)
+func assessKey(cfg Config, key bifrost.Key, byLabel map[string]*quotas.Agent) assessStatus {
 	if !routingEnabled(key) {
-		return -1
+		return assessSkip
 	}
 	if key.Status != "success" {
-		return 0
+		return assessBlocked
 	}
 
 	agent := byLabel[LabelFromEnv(key.Value.Ref)]
 	if agent == nil || agent.Error != "" {
-		return -1
+		return assessSkip
 	}
 
-	// Rule 2: rolling 5h blocker. Graded on raw consumption (no pace maths).
 	if rolling := agent.RollingPercent(); rolling >= 0 && rolling >= cfg.RollingEvictPercent {
-		return 0
+		return assessBlocked
 	}
-
-	// Rule 3: weekly blocker. Graded on raw consumption, like the rolling
-	// window — no projection-based eviction.
 	if weekly := agent.WeeklyPercent(); weekly >= 0 && weekly >= cfg.WeeklyEvictPercent {
-		return 0
+		return assessBlocked
 	}
-
-	// Rule 4: monthly quota exhausted — STRICT ceiling only.
 	if monthly := agent.MonthlyPercent(); monthly >= 100 {
-		return 0
+		return assessBlocked
 	}
-
-	// Rule 5: burn the monthly — weight proportional to what would be lost.
-	if u, ok := urgency(agent); ok {
-		return u
-	}
-	return -1
+	return assessOK
 }
 
 // LabelFromEnv derives the subscription label from a Bifrost env reference.
