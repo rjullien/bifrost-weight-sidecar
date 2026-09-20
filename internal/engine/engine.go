@@ -1,14 +1,16 @@
 // Package engine turns Bifrost key state and OpenCode Go quota positions into
 // weight changes.
 //
-// Weight policy — "burn monthly to 100% before reset, blockers, fail-open spare":
+// Weight policy — "burn monthly to 100% by J−1 (reset−BurnLead), blockers,
+// fail-open spare":
 //
 //   - The MONTHLY quota is lost if not consumed before the subscription
-//     anniversary reset (use-it-or-lose-it). The goal is to burn every
-//     assessable key to 100% before that reset.
-//   - Keys projected to hit 100% in time (MonthlyDryDays > 0) do not need
+//     anniversary reset (use-it-or-lose-it). The goal is to finish every
+//     assessable key to 100% one full BurnLead (default 24h) before that
+//     reset — the J−1 burn wall used by quotas.MonthlyDryDays.
+//   - Keys projected to hit 100% by the wall (MonthlyDryDays > 0) do not need
 //     burn-priority traffic. Keys that still have remaining monthly AND will
-//     NOT hit 100% at current pace (MonthlyDryDays == 0) are under-burners:
+//     NOT hit 100% by the wall (MonthlyDryDays == 0) are under-burners:
 //     when any exist, they receive all weight (winner-take-all / split by
 //     urgency), normalized so active targets sum to 100.
 //   - The WEEKLY and ROLLING 5h quotas are hard blockers graded on raw
@@ -111,8 +113,9 @@ func urgency(agent *quotas.Agent) (float64, bool) {
 }
 
 // underBurner is a key with remaining monthly quota that will NOT reach 100%
-// before the anniversary reset at the current pace (MonthlyDryDays == 0).
-// MonthlyDryDays > 0 means on track to hit the ceiling; -1 means unknown.
+// by the J−1 burn wall (resetsAt−BurnLead) at the current pace
+// (MonthlyDryDays == 0). MonthlyDryDays > 0 means on track for that wall;
+// -1 means unknown.
 func underBurner(agent *quotas.Agent) bool {
 	if agent == nil || agent.Error != "" {
 		return false

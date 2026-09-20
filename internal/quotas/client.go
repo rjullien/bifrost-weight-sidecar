@@ -21,6 +21,11 @@ var apiURL = "https://opencode.ai/zen/go/v1/usage"
 const (
 	maxConcurrentRequests = 4
 	maxResponseBody       = 1 << 20 // 1 MiB
+
+	// DefaultBurnLead is how far before the monthly anniversary reset the
+	// burn wall sits (J−1). DryDays / under-burner detection aim to finish
+	// the monthly quota by this wall, not merely by resetsAt.
+	DefaultBurnLead = 24 * time.Hour
 )
 
 // Agent is one subscription enriched with local budget computation.
@@ -63,17 +68,31 @@ type windowRaw struct {
 // Client calls the OpenCode Go usage API.
 type Client struct {
 	http *http.Client
+	// BurnLead is subtracted from the monthly resetsAt when computing DryDays.
+	// Zero disables the lead (deadline = anniversary reset). Negative values
+	// are treated as DefaultBurnLead. Weekly budgets ignore BurnLead.
+	BurnLead time.Duration
 }
 
 // NewClient creates a Client that refuses redirects so credentials are never
-// forwarded to a different origin.
+// forwarded to a different origin. BurnLead defaults to DefaultBurnLead (24h).
 func NewClient(timeout time.Duration) *Client {
-	return &Client{http: &http.Client{
-		Timeout: timeout,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
+	return &Client{
+		http: &http.Client{
+			Timeout: timeout,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
-	}}
+		BurnLead: DefaultBurnLead,
+	}
+}
+
+func (c *Client) burnLead() time.Duration {
+	if c.BurnLead < 0 {
+		return DefaultBurnLead
+	}
+	return c.BurnLead
 }
 
 // Keys maps a display label (Main, A, N, R, …) to its API key value.
@@ -159,13 +178,14 @@ func (c *Client) fetchKey(ctx context.Context, apiKey string, now time.Time) ([]
 		return nil, fmt.Errorf("API OpenCode HTTP %d", resp.StatusCode)
 	}
 
-	return parseWindowsAt(body, now)
+	return parseWindowsAt(body, now, c.burnLead())
 }
 
 // parseWindowsAt fails closed: both policy windows must be present, healthy,
 // bounded and active at the cycle timestamp. The private /usage schema is not
 // publicly documented, so only the captured production status "ok" is trusted.
-func parseWindowsAt(body []byte, now time.Time) ([]Window, error) {
+// burnLead applies only to the monthly DryDays wall (see computeBudget).
+func parseWindowsAt(body []byte, now time.Time, burnLead time.Duration) ([]Window, error) {
 	var resp apiResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("réponse API invalide: %w", err)
@@ -174,11 +194,11 @@ func parseWindowsAt(body []byte, now time.Time) ([]Window, error) {
 		return nil, fmt.Errorf("réponse API incomplète: fenêtres monthly et weekly requises")
 	}
 
-	monthly, err := periodWindowFrom("Monthly", resp.Usage.Monthly, now)
+	monthly, err := periodWindowFrom("Monthly", resp.Usage.Monthly, now, burnLead)
 	if err != nil {
 		return nil, err
 	}
-	weekly, err := periodWindowFrom("Weekly", resp.Usage.Weekly, now)
+	weekly, err := periodWindowFrom("Weekly", resp.Usage.Weekly, now, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -208,12 +228,12 @@ func rawWindowFrom(name string, raw *windowRaw) (Window, error) {
 	return Window{Name: name, Percent: *raw.Percent, Resets: reset.Format(time.RFC3339)}, nil
 }
 
-func periodWindowFrom(name string, raw *windowRaw, now time.Time) (Window, error) {
+func periodWindowFrom(name string, raw *windowRaw, now time.Time, burnLead time.Duration) (Window, error) {
 	window, err := rawWindowFrom(name, raw)
 	if err != nil {
 		return Window{}, err
 	}
-	budget := computeBudget(window, now)
+	budget := computeBudget(window, now, burnLead)
 	if !budget.Valid {
 		return Window{}, fmt.Errorf("fenêtre %s invalide: reset hors période active", name)
 	}
@@ -221,9 +241,15 @@ func periodWindowFrom(name string, raw *windowRaw, now time.Time) (Window, error
 	return window, nil
 }
 
-// computeBudget reproduces the dashboard pace math. A reset is valid only
-// while now belongs to the corresponding active weekly/monthly period.
-func computeBudget(w Window, now time.Time) Budget {
+// computeBudget reproduces the dashboard pace math with one monthly twist:
+// DryDays is measured against a burn wall of resetsAt−burnLead (J−1 by
+// default), so a key that would only hit 100% on the final day before reset
+// is an under-burner. DaysLeft stays anchored on the real anniversary reset
+// (urgency / observability). Weekly windows pass burnLead=0.
+//
+// A reset is valid only while now belongs to the corresponding active
+// weekly/monthly period.
+func computeBudget(w Window, now time.Time, burnLead time.Duration) Budget {
 	reset, err := time.Parse(time.RFC3339, w.Resets)
 	if err != nil || reset.IsZero() || w.Percent < 0 || w.Percent > 100 {
 		return Budget{}
@@ -256,14 +282,24 @@ func computeBudget(w Window, now time.Time) Budget {
 	consumed := float64(w.Percent)
 	remaining := 100 - consumed
 
+	// Effective deadline for DryDays: monthly burn wall, else the reset itself.
+	deadline := reset
+	if burnLead > 0 {
+		deadline = reset.Add(-burnLead)
+	}
+	daysToDeadline := deadline.Sub(now).Hours() / 24
+
 	switch {
 	case consumed >= 100:
 		b.DryDays = daysLeft
+	case daysToDeadline <= 0:
+		// Past the burn wall with remaining quota → under-burner.
+		b.DryDays = 0
 	case elapsed.Hours() > 0 && consumed > 0:
 		ratePerDay := consumed / (elapsed.Hours() / 24)
-		daysToWall := remaining / ratePerDay
-		if daysToWall < daysLeft {
-			b.DryDays = daysLeft - daysToWall
+		daysToFull := remaining / ratePerDay
+		if daysToFull < daysToDeadline {
+			b.DryDays = daysToDeadline - daysToFull
 		}
 	}
 	return b
@@ -332,7 +368,8 @@ func (a *Agent) RollingPercent() int {
 }
 
 // MonthlyDaysLeft returns the number of days remaining until the monthly
-// reset (anniversary), or -1 when unknown.
+// anniversary reset, or -1 when unknown. Urgency uses this value; DryDays
+// alone is measured against the earlier burn wall (resetsAt−BurnLead).
 func (a *Agent) MonthlyDaysLeft() float64 {
 	for _, w := range a.Windows {
 		if w.Name == "Monthly" && w.Budget != nil && w.Budget.Valid {

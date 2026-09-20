@@ -15,9 +15,9 @@ func key(id, name, ref string, weight float64, status string) bifrost.Key {
 // agent builds a quota agent: monthly percent + monthly dry days + monthly
 // days left + weekly percent + weekly dry days. Rolling 5h defaults to 0.
 //
-// MonthlyDryDays semantics (from quotas.computeBudget):
-//   - DryDays > 0 → projected to hit 100% before reset (on track)
-//   - DryDays == 0 → will NOT hit 100% at current pace (under-burner)
+// MonthlyDryDays semantics (from quotas.computeBudget with BurnLead=24h):
+//   - DryDays > 0 → projected to hit 100% by the J−1 burn wall (on track)
+//   - DryDays == 0 → will NOT hit 100% by the wall at current pace (under-burner)
 func agent(label string, monthlyPct int, monthlyDry, monthlyDaysLeft float64, weeklyPct int, weeklyDry float64) quotas.Agent {
 	return agentRolling(label, monthlyPct, monthlyDry, monthlyDaysLeft, weeklyPct, weeklyDry, 0)
 }
@@ -105,6 +105,54 @@ func TestComputeUnderBurnerGetsHundred(t *testing.T) {
 	}
 	if sum := sumPositive(final, "opencode-go-key-1", "opencode-go-key-2", "opencode-go-key-3", "opencode-go-key-4"); !WeightsEqual(sum, 100) {
 		t.Errorf("sum of applied targets = %v, want 100", sum)
+	}
+}
+
+// Nicole-style what-if: 98% monthly with ~1.1d to reset looks "on-track" vs
+// anniversary (DryDays≈0.5) but is an under-burner vs the J−1 wall
+// (DryDays=0). She must take all managed weight against on-track peers.
+func TestComputeNicoleStyleJMinus1UnderBurnerTakesAll(t *testing.T) {
+	tests := []struct {
+		name      string
+		nPct      int
+		nDry      float64
+		nDaysLeft float64
+		wantN     float64
+		wantPeers float64
+	}{
+		{
+			name:      "98pct_1.1d_under_vs_J-1",
+			nPct:      98,
+			nDry:      0, // quotas.computeBudget with BurnLead=24h
+			nDaysLeft: 1.1,
+			wantN:     100,
+			wantPeers: 0,
+		},
+		{
+			name:      "far_from_reset_ontrack_equal_share",
+			nPct:      80,
+			nDry:      2, // still slack before J−1
+			nDaysLeft: 20,
+			wantN:     25, // all on-track equal urgency → already at 25, no change
+			wantPeers: 25,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agents := healthyAgents()
+			agents[3] = agent("N", tt.nPct, tt.nDry, tt.nDaysLeft, 50, 0)
+			changes := Compute(Config{}, Input{Keys: healthyKeys(), Agents: agents})
+			final := finalWeights(healthyKeys(), changes)
+			if !WeightsEqual(final["opencode-go-key-4"], tt.wantN) {
+				t.Errorf("N = %v, want %v", final["opencode-go-key-4"], tt.wantN)
+			}
+			for _, name := range []string{"opencode-go-key-1", "opencode-go-key-2", "opencode-go-key-3"} {
+				if !WeightsEqual(final[name], tt.wantPeers) {
+					t.Errorf("%s = %v, want %v", name, final[name], tt.wantPeers)
+				}
+			}
+		})
 	}
 }
 

@@ -29,6 +29,7 @@ type config struct {
 	DryRun              bool
 	RollingEvictPercent int
 	WeeklyEvictPercent  int
+	MonthlyBurnLead     time.Duration
 }
 
 // defaultRollingEvictPercent matches the engine default: at 99% the rolling 5h
@@ -89,6 +90,10 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	burnLead, err := envDurationAllowZero("MONTHLY_BURN_LEAD", quotas.DefaultBurnLead)
+	if err != nil {
+		return config{}, err
+	}
 	return config{
 		BifrostURL:          bifrostURL,
 		Interval:            interval,
@@ -98,6 +103,7 @@ func loadConfig() (config, error) {
 		DryRun:              dryRun,
 		RollingEvictPercent: rollingEvict,
 		WeeklyEvictPercent:  weeklyEvict,
+		MonthlyBurnLead:     burnLead,
 	}, nil
 }
 
@@ -106,11 +112,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("configuration invalide: %v", err)
 	}
-	log.Printf("sidecar: bifrost=%s interval=%s cycle_timeout=%s retry_backoff=%s pinned=%v dry_run=%v rolling_evict=%d%% weekly_evict=%d%% policy=cramer-monthly (weekly+rolling=bloqueurs, secours >= 2)",
-		urlForLog(cfg.BifrostURL), cfg.Interval, cfg.CycleTimeout, cfg.RetryBackoff, cfg.Pinned, cfg.DryRun, cfg.RollingEvictPercent, cfg.WeeklyEvictPercent)
+	log.Printf("sidecar: bifrost=%s interval=%s cycle_timeout=%s retry_backoff=%s pinned=%v dry_run=%v rolling_evict=%d%% weekly_evict=%d%% monthly_burn_lead=%s policy=cramer-monthly-J-1 (weekly+rolling=bloqueurs, secours >= 2)",
+		urlForLog(cfg.BifrostURL), cfg.Interval, cfg.CycleTimeout, cfg.RetryBackoff, cfg.Pinned, cfg.DryRun, cfg.RollingEvictPercent, cfg.WeeklyEvictPercent, cfg.MonthlyBurnLead)
 
 	bf := bifrost.NewClient(cfg.BifrostURL, 5*time.Second)
 	qu := quotas.NewClient(5 * time.Second)
+	qu.BurnLead = cfg.MonthlyBurnLead
 	pol := engine.Config{Pinned: cfg.Pinned, MinActive: 2, RollingEvictPercent: cfg.RollingEvictPercent, WeeklyEvictPercent: cfg.WeeklyEvictPercent}
 
 	root, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -433,6 +440,26 @@ func envDuration(key string, def time.Duration) (time.Duration, error) {
 	}
 	if d <= 0 {
 		return 0, fmt.Errorf("%s=%q: la durée doit être strictement positive", key, v)
+	}
+	return d, nil
+}
+
+// envDurationAllowZero is like envDuration but accepts 0 (e.g. MONTHLY_BURN_LEAD=0
+// or 0s aligns the burn wall on the anniversary reset — pre-J−1 behaviour).
+func envDurationAllowZero(key string, def time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	if v == "0" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s=%q: durée invalide: %w", key, v, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s=%q: la durée ne doit pas être négative", key, v)
 	}
 	return d, nil
 }

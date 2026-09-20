@@ -88,10 +88,11 @@ func TestUsageKeyError(t *testing.T) {
 }
 
 func TestComputeBudgetMonthly(t *testing.T) {
-	// Reset 2026-09-22, now 2026-09-10, 52% consumed → budget holds (dryDays 0).
+	// Reset 2026-09-22, now 2026-09-10, 52% consumed → still short of the
+	// J−1 wall at current pace (dryDays 0), with or without burn lead.
 	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
 	w := Window{Name: "Monthly", Percent: 52, Resets: "2026-09-22T01:23:30.000Z"}
-	b := computeBudget(w, now)
+	b := computeBudget(w, now, DefaultBurnLead)
 	if !b.Valid {
 		t.Fatal("budget should be valid")
 	}
@@ -101,9 +102,88 @@ func TestComputeBudgetMonthly(t *testing.T) {
 
 	// At the ceiling: 100% → dry until reset.
 	w2 := Window{Name: "Monthly", Percent: 100, Resets: "2026-09-22T01:23:30.000Z"}
-	b2 := computeBudget(w2, now)
+	b2 := computeBudget(w2, now, DefaultBurnLead)
 	if !b2.Valid || b2.DryDays <= 0 {
 		t.Errorf("ceiling dryDays = %v (valid=%v), want >0", b2.DryDays, b2.Valid)
+	}
+}
+
+// TestComputeBudgetMonthlyJMinus1Wall covers the Nicole-style what-if: a key
+// projected to hit 100% before the anniversary reset, but only after the J−1
+// burn wall, must report DryDays == 0 (under-burner). Far from reset with
+// comfortable pace stays on-track (DryDays > 0).
+func TestComputeBudgetMonthlyJMinus1Wall(t *testing.T) {
+	tests := []struct {
+		name     string
+		now      time.Time
+		percent  int
+		resets   string
+		burnLead time.Duration
+		wantDry  string // "under" (0) or "ontrack" (>0)
+	}{
+		{
+			// Live-shaped: 2026-09-20 21:36 UTC, reset 2026-09-22 00:00,
+			// ~1.1d left, 98% consumed. Against resetsAt DryDays≈0.5 (on-track);
+			// against J−1 wall → under-burner.
+			name:     "nicole_98pct_1.1d_vs_J-1",
+			now:      time.Date(2026, 9, 20, 21, 36, 0, 0, time.UTC),
+			percent:  98,
+			resets:   "2026-09-22T00:00:00.000Z",
+			burnLead: DefaultBurnLead,
+			wantDry:  "under",
+		},
+		{
+			// Same snapshot with burn lead disabled → still on-track vs reset.
+			name:     "nicole_ontrack_without_lead",
+			now:      time.Date(2026, 9, 20, 21, 36, 0, 0, time.UTC),
+			percent:  98,
+			resets:   "2026-09-22T00:00:00.000Z",
+			burnLead: 0,
+			wantDry:  "ontrack",
+		},
+		{
+			// Mid-cycle, pace finishes well before J−1 → on-track.
+			name:     "far_from_reset_ontrack",
+			now:      time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC),
+			percent:  70,
+			resets:   "2026-09-22T00:00:00.000Z",
+			burnLead: DefaultBurnLead,
+			wantDry:  "ontrack",
+		},
+		{
+			// Already inside the final 24h before reset with remaining → under.
+			name:     "past_wall_remaining_under",
+			now:      time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC),
+			percent:  95,
+			resets:   "2026-09-22T00:00:00.000Z",
+			burnLead: DefaultBurnLead,
+			wantDry:  "under",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := Window{Name: "Monthly", Percent: tt.percent, Resets: tt.resets}
+			b := computeBudget(w, tt.now, tt.burnLead)
+			if !b.Valid {
+				t.Fatalf("budget invalid")
+			}
+			if b.DaysLeft <= 0 {
+				t.Fatalf("DaysLeft = %v, want >0 until real reset", b.DaysLeft)
+			}
+			switch tt.wantDry {
+			case "under":
+				if b.DryDays != 0 {
+					t.Errorf("DryDays = %v, want 0 (under-burner vs J−1 wall)", b.DryDays)
+				}
+			case "ontrack":
+				if b.DryDays <= 0 {
+					t.Errorf("DryDays = %v, want >0 (on-track for burn wall)", b.DryDays)
+				}
+			default:
+				t.Fatalf("unknown wantDry %q", tt.wantDry)
+			}
+		})
 	}
 }
 
