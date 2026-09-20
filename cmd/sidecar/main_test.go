@@ -144,6 +144,39 @@ func TestLoadConfigValidatesRetryBackoff(t *testing.T) {
 	}
 }
 
+func TestLoadConfigMonthlyBurnLead(t *testing.T) {
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.MonthlyBurnLead != quotas.DefaultBurnLead {
+		t.Fatalf("MonthlyBurnLead = %s, want default %s", cfg.MonthlyBurnLead, quotas.DefaultBurnLead)
+	}
+
+	t.Setenv("MONTHLY_BURN_LEAD", "0")
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.MonthlyBurnLead != 0 {
+		t.Fatalf("MonthlyBurnLead = %s, want 0 (reset-aligned wall)", cfg.MonthlyBurnLead)
+	}
+
+	t.Setenv("MONTHLY_BURN_LEAD", "12h")
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.MonthlyBurnLead != 12*time.Hour {
+		t.Fatalf("MonthlyBurnLead = %s, want 12h", cfg.MonthlyBurnLead)
+	}
+
+	t.Setenv("MONTHLY_BURN_LEAD", "-1h")
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("loadConfig accepted negative MONTHLY_BURN_LEAD")
+	}
+}
+
 // runCycle must signal that Bifrost is unreachable so the caller retries with a
 // backoff instead of sleeping the full interval.
 func TestRunCycleReportsBifrostUnreachable(t *testing.T) {

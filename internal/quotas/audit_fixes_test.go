@@ -179,7 +179,7 @@ func TestParseWindowsFailsClosedOnIncompleteOrInvalidPolicyWindows(t *testing.T)
 		t.Run(test.name, func(t *testing.T) {
 			monthlyCopy, weeklyCopy := *validMonthly, *validWeekly
 			monthly, weekly := test.mutate(&monthlyCopy, &weeklyCopy)
-			_, err := parseWindowsAt(marshalUsage(t, monthly, weekly, nil), now)
+			_, err := parseWindowsAt(marshalUsage(t, monthly, weekly, nil), now, DefaultBurnLead)
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("parseWindowsAt error = %v, want %q", err, test.wantErr)
 			}
@@ -264,7 +264,7 @@ func TestParseWindowsIgnoresMalformedOptionalRollingWindow(t *testing.T) {
 		Status: "error", Percent: intPointer(101), ResetsAt: "not-a-date",
 	}
 
-	windows, err := parseWindowsAt(marshalUsage(t, monthly, weekly, rolling), now)
+	windows, err := parseWindowsAt(marshalUsage(t, monthly, weekly, rolling), now, DefaultBurnLead)
 	if err != nil {
 		t.Fatalf("parseWindowsAt rejected valid policy windows because rolling was malformed: %v", err)
 	}
