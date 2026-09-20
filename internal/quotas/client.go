@@ -279,9 +279,9 @@ func (a *Agent) MonthlyDryDays() float64 {
 }
 
 // WeeklyDryDays returns the number of days the weekly quota would sit at the
-// ceiling (0 = the budget holds), or -1 when unknown. The weekly is a
-// blocker, not a loss: when it hits the ceiling the key stops serving, so the
-// engine anticipates it.
+// ceiling (0 = the budget holds), or -1 when unknown. Kept as an accessor for
+// observability; the engine grades the weekly on raw consumption (WeeklyPercent)
+// against a threshold, not on this projection.
 func (a *Agent) WeeklyDryDays() float64 {
 	for _, w := range a.Windows {
 		if w.Name == "Weekly" && w.Budget != nil && w.Budget.Valid {

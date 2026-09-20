@@ -34,11 +34,19 @@ func TestComputeTreatsMissingBifrostStatusAsUnhealthy(t *testing.T) {
 	}
 }
 
+// With MinActive=3 and only two keys able to serve (the other two burned at
+// 100%), the fallback re-arms the two live keys but never resurrects the burned
+// ones: it prefers a degraded pool over routing to keys that fail. Active ends
+// at 2, not 3 — MinActive is a ceiling on effort, not a guarantee to route to
+// dead keys.
 func TestComputeHonorsMinActiveAboveTwo(t *testing.T) {
 	agents := healthyAgents()
-	for i := range agents {
-		agents[i] = agent(agents[i].Label, 40, 0, 20, 95, 2)
-	}
+	// Two burned (100%), two with burnable monthly but currently at weight 0
+	// only via the fallback path — here they simply serve on their urgency.
+	agents[0] = agent("Main", 100, 4, 4, 50, 0) // burned
+	agents[1] = agent("R", 100, 4, 4, 50, 0)    // burned
+	agents[2] = agent("A", 40, 0, 20, 50, 0)    // live (urgency 3)
+	agents[3] = agent("N", 40, 0, 20, 50, 0)    // live (urgency 3)
 
 	changes := Compute(Config{MinActive: 3}, Input{Keys: healthyKeys(), Agents: agents})
 	final := map[string]float64{}
@@ -48,14 +56,20 @@ func TestComputeHonorsMinActiveAboveTwo(t *testing.T) {
 	for _, change := range changes {
 		final[change.Key.Name] = change.To
 	}
+	// Burned keys stay at 0.
+	if final["opencode-go-key-1"] != 0 || final["opencode-go-key-2"] != 0 {
+		t.Errorf("burned keys alive! Main=%v R=%v, want 0/0", final["opencode-go-key-1"], final["opencode-go-key-2"])
+	}
+	// Only the two live keys serve: MinActive=3 cannot conjure a third from
+	// burned keys.
 	active := 0
 	for _, weight := range final {
 		if weight > 0 {
 			active++
 		}
 	}
-	if active != 3 {
-		t.Fatalf("active = %d, weights = %v, want 3", active, final)
+	if active != 2 {
+		t.Fatalf("active = %d, weights = %v, want 2 (two live keys, burned never re-armed)", active, final)
 	}
 }
 

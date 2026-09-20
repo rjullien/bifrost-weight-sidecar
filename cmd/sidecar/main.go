@@ -31,11 +31,16 @@ type config struct {
 	Pinned              map[string]bool
 	DryRun              bool
 	RollingEvictPercent int
+	WeeklyEvictPercent  int
 }
 
 // defaultRollingEvictPercent matches the engine default: at 99% the rolling 5h
 // window is treated as critical and the key is taken out of rotation.
 const defaultRollingEvictPercent = 99
+
+// defaultWeeklyEvictPercent matches the engine default: at 99% the weekly
+// window is treated as critical and the key is taken out of rotation.
+const defaultWeeklyEvictPercent = 99
 
 const (
 	// retryBackoffStart : délai initial après un échec de connexion à Bifrost.
@@ -64,6 +69,10 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	weeklyEvict, err := envPercent("WEEKLY_EVICT_PERCENT", defaultWeeklyEvictPercent)
+	if err != nil {
+		return config{}, err
+	}
 	return config{
 		BifrostURL:          bifrostURL,
 		Interval:            interval,
@@ -71,6 +80,7 @@ func loadConfig() (config, error) {
 		Pinned:              envSetOr("PINNED_KEYS", nil),
 		DryRun:              envBoolOr("DRY_RUN", false),
 		RollingEvictPercent: rollingEvict,
+		WeeklyEvictPercent:  weeklyEvict,
 	}, nil
 }
 
@@ -79,12 +89,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("configuration invalide: %v", err)
 	}
-	log.Printf("sidecar: bifrost=%s interval=%s pinned=%v dry_run=%v rolling_evict=%d%% policy=cramer-monthly (weekly+rolling=bloqueurs, secours >= 2)",
-		urlForLog(cfg.BifrostURL), cfg.Interval, cfg.Pinned, cfg.DryRun, cfg.RollingEvictPercent)
+	log.Printf("sidecar: bifrost=%s interval=%s pinned=%v dry_run=%v rolling_evict=%d%% weekly_evict=%d%% policy=cramer-monthly (weekly+rolling=bloqueurs, secours >= 2)",
+		urlForLog(cfg.BifrostURL), cfg.Interval, cfg.Pinned, cfg.DryRun, cfg.RollingEvictPercent, cfg.WeeklyEvictPercent)
 
 	bf := bifrost.NewClient(cfg.BifrostURL, 5*time.Second)
 	qu := quotas.NewClient(5 * time.Second)
-	pol := engine.Config{Pinned: cfg.Pinned, MinActive: 2, RollingEvictPercent: cfg.RollingEvictPercent}
+	pol := engine.Config{Pinned: cfg.Pinned, MinActive: 2, RollingEvictPercent: cfg.RollingEvictPercent, WeeklyEvictPercent: cfg.WeeklyEvictPercent}
 
 	run := func() bool {
 		keys, err := bf.Keys()

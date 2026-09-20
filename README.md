@@ -30,29 +30,34 @@ d'environnement (`env.OPENCODE_GO_API_KEY_A` → label `A`,
 
 ## Règles (par ordre de priorité)
 
-**Politique : « cramer le monthly, garde-fou weekly, secours ≥ 2 »** — le quota
-mensuel non consommé avant le reset anniversaire est **perdu**, donc le poids
-d'une clé reflète l'urgence de consommation :
+**Politique : « cramer le monthly, garde-fous weekly + rolling, secours ≥ 2 »** —
+le quota mensuel non consommé avant le reset anniversaire est **perdu**, donc le
+poids d'une clé reflète l'urgence de consommation :
 
 | # | Règle | Poids |
 |---|-------|-------|
 | 1 | Bifrost signale la clé non saine (`status != success`) | `0` |
-| 2 | Rolling 5h ≥ `ROLLING_EVICT_PERCENT` (bloqueur immédiat) | `0` |
-| 3 | Weekly projeté à sec avant son reset lundi (bloqueur) | `0` |
+| 2 | Rolling 5h ≥ `ROLLING_EVICT_PERCENT` (bloqueur, brut) | `0` |
+| 3 | Weekly ≥ `WEEKLY_EVICT_PERCENT` (bloqueur, brut) | `0` |
 | 4 | Monthly à **100 %** (plafond strict, plus rien à cramer) | `0` |
 | 5 | Sinon | **urgence** = monthly restant (%) ÷ jours restants |
 
-**Monthly** : évincé **uniquement à 100 %**, pas sur une projection. Le quota
-mensuel non consommé est perdu au reset (*use-it-or-lose-it*) : une clé « projetée
-à sec » mais encore sous 100 % garde du quota à cramer, donc elle **reste en
-rotation** (avec une urgence plus élevée) plutôt que de gaspiller. Seul le weekly,
-qui est un *bloqueur* et non une perte, est anticipé sur sa projection.
+**Bloqueurs (rolling & weekly)** : gradés sur la **consommation brute** à un seuil
+proche du plafond (**99 %** par défaut, chacun réglable). À ce niveau la clé est
+déjà en train d'échouer — inutile de lui envoyer du trafic. Pas de projection :
 
-**Rolling 5h** : c'est un bloqueur *court*. À `ROLLING_EVICT_PERCENT` (99 % par
-défaut) la clé est déjà en train d'échouer, on la sort de rotation. Il n'y a pas
-de projection : la fenêtre glissante de 5 h se vide seule, donc la clé
-**réintègre la rotation d'elle-même** à un cycle suivant dès que le rolling
-repasse sous le seuil. Une clé bloquée uniquement sur le
+- **Rolling 5h** — fenêtre glissante qui se vide seule, la clé **réintègre la
+  rotation d'elle-même** dès qu'elle repasse sous le seuil.
+- **Weekly** — bloqueur jusqu'au reset du lundi ; même logique de retour
+  automatique une fois la fenêtre réinitialisée.
+
+**Monthly** : évincé **uniquement à 100 %**, jamais sur une projection. Le quota
+mensuel non consommé est perdu au reset (*use-it-or-lose-it*) : une clé encore
+sous 100 % garde du quota à cramer, donc elle **reste en rotation** (avec une
+urgence plus élevée) plutôt que de gaspiller.
+
+Une clé bloquée (rolling, weekly, monthly à 100 % ou morte côté Bifrost) n'est
+**jamais** réarmée par le filet de secours : elle échouerait. Une clé bloquée uniquement sur le
 rolling n'est **jamais** réarmée par le filet de secours (elle échouerait).
 
 **Urgence** : plus le monthly restant expire vite, plus le poids est élevé (la
@@ -77,6 +82,7 @@ en erreur) est laissée **intacte** : jamais de décision sur données incomplè
 | `BIFROST_URL` | `http://127.0.0.1:8080` | URL HTTP(S) absolue du gateway Bifrost, sans query ni fragment (localhost IPv4 quand sidecar dans le pod) |
 | `INTERVAL` | `10m` | Durée strictement positive entre la fin d’un cycle et le suivant (`10m`, `30m`, `45s`, …) |
 | `ROLLING_EVICT_PERCENT` | `99` | Seuil (%) du rolling 5h au-delà duquel la clé sort de rotation. Entier dans `[1,100]` |
+| `WEEKLY_EVICT_PERCENT` | `99` | Seuil (%) du weekly au-delà duquel la clé sort de rotation. Entier dans `[1,100]` |
 | `PINNED_KEYS` | *(vide)* | Clés à ne JAMAIS toucher, séparées par des virgules (nom ou id) |
 | `DRY_RUN` | `false` | Log les changements sans les appliquer |
 | `OPENCODE_GO_API_KEY*` | *(requis)* | Clés OpenCode Go à surveiller : `OPENCODE_GO_API_KEY` = Main, `OPENCODE_GO_API_KEY_A` = A, etc. |
