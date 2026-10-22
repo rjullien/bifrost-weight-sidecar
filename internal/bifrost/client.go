@@ -16,8 +16,11 @@ import (
 )
 
 const (
-	provider        = "opencode-go"
-	maxResponseBody = 1 << 20 // 1 MiB
+	provider = "opencode-go"
+	// SetupTokenHeader is the header Bifrost >= v2.2.6 (OSS) requires on every
+	// /api call while dashboard auth is not active (setup lock).
+	SetupTokenHeader = "X-Bifrost-Setup-Token"
+	maxResponseBody  = 1 << 20 // 1 MiB
 )
 
 // Key is one provider key as exposed by the Bifrost management API.
@@ -63,8 +66,22 @@ type keysResponse struct {
 
 // Client calls the Bifrost management API.
 type Client struct {
-	http    *http.Client
-	baseURL string
+	http       *http.Client
+	baseURL    string
+	setupToken string
+}
+
+// SetSetupToken configures the optional Bifrost setup token sent as
+// X-Bifrost-Setup-Token on every management API request. An empty value
+// (default) sends no header, keeping the pre-v2.2.6 behaviour.
+func (c *Client) SetSetupToken(token string) {
+	c.setupToken = strings.TrimSpace(token)
+}
+
+func (c *Client) setAuthHeaders(req *http.Request) {
+	if c.setupToken != "" {
+		req.Header.Set(SetupTokenHeader, c.setupToken)
+	}
 }
 
 // NewClient creates a short-timeout client and refuses every redirect. A 302
@@ -129,6 +146,7 @@ func (c *Client) get(ctx context.Context, endpoint string) ([]byte, error) {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
+	c.setAuthHeaders(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("bifrost injoignable: %w", err)
@@ -189,6 +207,7 @@ func (c *Client) SetWeightContext(ctx context.Context, key Key, weight float64) 
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
+	c.setAuthHeaders(req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
