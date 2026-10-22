@@ -116,6 +116,12 @@ func main() {
 		urlForLog(cfg.BifrostURL), cfg.Interval, cfg.CycleTimeout, cfg.RetryBackoff, cfg.Pinned, cfg.DryRun, cfg.RollingEvictPercent, cfg.WeeklyEvictPercent, cfg.MonthlyBurnLead)
 
 	bf := bifrost.NewClient(cfg.BifrostURL, 5*time.Second)
+	// Optional: Bifrost >= v2.2.6 locks /api behind a setup token while
+	// dashboard auth is off. Never logged.
+	if token := strings.TrimSpace(os.Getenv("BIFROST_SETUP_TOKEN")); token != "" {
+		bf.SetSetupToken(token)
+		log.Printf("sidecar: setup token bifrost configuré (header %s)", bifrost.SetupTokenHeader)
+	}
 	qu := quotas.NewClient(5 * time.Second)
 	qu.BurnLead = cfg.MonthlyBurnLead
 	pol := engine.Config{Pinned: cfg.Pinned, MinActive: 2, RollingEvictPercent: cfg.RollingEvictPercent, WeeklyEvictPercent: cfg.WeeklyEvictPercent}

@@ -105,6 +105,7 @@ que le monthly reste évaluable.
 | Variable | Défaut | Description |
 |----------|--------|-------------|
 | `BIFROST_URL` | `http://127.0.0.1:8080` | URL HTTP(S) absolue du gateway Bifrost, sans query ni fragment (localhost IPv4 quand sidecar dans le pod) |
+| `BIFROST_SETUP_TOKEN` | _(vide)_ | Optionnel. Envoyé en header `X-Bifrost-Setup-Token` sur tous les appels `/api` (requis par Bifrost OSS ≥ v2.2.6 quand l'auth dashboard est désactivée). Vide = aucun header (comportement historique). Jamais loggé. |
 | `INTERVAL` | `10m` | Durée strictement positive entre la fin d’un cycle et le suivant (`10m`, `30m`, `45s`, …) |
 | `CYCLE_TIMEOUT` | `5m` | Durée maximale strictement positive d'un cycle complet ; annule aussi les requêtes HTTP en cours |
 | `RETRY_BACKOFF` | `15s` | Délai initial strictement positif avant réessai quand Bifrost est injoignable ; double à chaque échec jusqu'à 5 min |
